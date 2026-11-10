@@ -1,0 +1,5 @@
+.env
+PLANO.md
+.venv/
+storage/
+.idea/

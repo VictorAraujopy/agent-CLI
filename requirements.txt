@@ -1,0 +1,4 @@
+# agent-CLI dependencies. Python 3.12.
+# llama-cpp-python is compiled at install time and needs your machine's flag: see "Installation" in the README.
+
+llama-cpp-python==0.3.35  # loads the .gguf and generates the text; the Python bridge to llama.cpp

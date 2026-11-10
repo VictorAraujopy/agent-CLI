@@ -3,3 +3,6 @@ PLANO.md
 .venv/
 storage/
 .idea/
+__pycache__/
+.DS_Store
+.claude/settings.local.json

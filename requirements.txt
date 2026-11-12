@@ -2,3 +2,6 @@
 # llama-cpp-python is compiled at install time and needs your machine's flag: see "Installation" in the README.
 
 llama-cpp-python==0.3.35  # loads the .gguf and generates the text; the Python bridge to llama.cpp
+textual==8.2.8  # draws the screen and reads the keyboard; the terminal application framework
+python-dotenv==1.2.4  # reads the .env file; the parser for the KEY=value format
+pytest==9.2.0  # runs the tests; the test runner

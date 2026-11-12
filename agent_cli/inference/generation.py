@@ -1,4 +1,4 @@
-"""Generation with a local model: the pieces of the reply, and how many tokens a conversation takes."""
+"""Generation with a local model: the pieces of the reply, and how much of the context is in use."""
 
 from collections.abc import Iterator
 from typing import cast
@@ -22,13 +22,10 @@ def generate_reply(model: Llama, messages: list[dict[str, str]]) -> Iterator[str
             yield text
 
 
-def count_tokens(model: Llama, messages: list[dict[str, str]]) -> int:
-    """Return how many tokens the text of the messages takes, counted with the model's own tokenizer."""
-    total = 0
-    for message in messages:
-        text = message["content"].encode()
-        total += len(model.tokenize(text, add_bos=False))
-    return total
+def tokens_in_context(model: Llama) -> int:
+    """Return how many tokens the context holds now: the last conversation sent and the reply written so far."""
+    # The library keeps this count itself, with everything the chat format adds around each message.
+    return model.n_tokens
 
 
 def context_limit(model: Llama) -> int:

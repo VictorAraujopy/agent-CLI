@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from llama_cpp import Llama
 
-from agent_cli.inference.generation import context_limit, count_tokens, generate_reply
+from agent_cli.inference.generation import context_limit, generate_reply, tokens_in_context
 from agent_cli.inference.loader import load_model, open_without_touching_the_terminal
 
 STORY_START = [{"role": "user", "content": "Once upon a time"}]
@@ -98,27 +98,24 @@ def test_whole_conversation_reaches_the_library(small_model: Llama, monkeypatch:
     assert messages_given_to_llama_cpp == conversation
 
 
-def test_empty_conversation_and_empty_text_count_no_token(small_model: Llama) -> None:
-    """Nothing to count gives zero, because no start-of-text token is added to a message."""
-    assert count_tokens(small_model, []) == 0
-    assert count_tokens(small_model, [{"role": "user", "content": ""}]) == 0
+def test_context_holds_the_whole_prompt_with_what_the_chat_format_adds(small_model: Llama) -> None:
+    """Once the reply starts, the count is the prompt the library sent, not just the text of the messages."""
+    prompt_sent = small_model.create_chat_completion(STORY_START, max_tokens=1)["usage"]["prompt_tokens"]
+    reply = generate_reply(small_model, STORY_START)
+    next(reply)
+    reply.close()
+    assert tokens_in_context(small_model) == prompt_sent
 
 
-def test_count_is_made_with_the_tokenizer_of_the_model(small_model: Llama) -> None:
-    """The count is the number of tokens the model's own tokenizer makes of the text, not of its characters."""
-    text = "The cat is under the table."
-    tokens_of_the_text = small_model.tokenize(text.encode(), add_bos=False)
-    assert count_tokens(small_model, [{"role": "user", "content": text}]) == len(tokens_of_the_text)
-
-
-def test_count_adds_the_tokens_of_every_message(small_model: Llama) -> None:
-    """The count of a conversation is the sum of the counts of its messages."""
-    question = {"role": "user", "content": "Where is the cat?"}
-    answer = {"role": "assistant", "content": "The cat is under the table."}
-    count_of_question = count_tokens(small_model, [question])
-    count_of_answer = count_tokens(small_model, [answer])
-    assert count_of_question > 0
-    assert count_tokens(small_model, [question, answer]) == count_of_question + count_of_answer
+def test_context_grows_with_every_piece_of_the_reply(small_model: Llama) -> None:
+    """While the reply is written, each new piece adds one token to the context."""
+    reply = generate_reply(small_model, STORY_START)
+    list(islice(reply, PIECES_TO_READ))
+    count_before = tokens_in_context(small_model)
+    list(islice(reply, PIECES_TO_READ))
+    count_after = tokens_in_context(small_model)
+    reply.close()
+    assert count_after - count_before == PIECES_TO_READ
 
 
 def test_context_limit_is_the_context_stored_in_the_gguf(small_model: Llama) -> None:

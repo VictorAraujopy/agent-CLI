@@ -1,0 +1,95 @@
+/* The look of the screen: where each part sits and how it is drawn. */
+
+Screen {
+    layout: vertical;
+    padding: 1 1 0 2;
+    background: $background;
+}
+
+#conversation {
+    width: 100%;
+    height: 1fr;
+    scrollbar-gutter: stable;
+    scrollbar-size-vertical: 1;
+}
+
+/* The banner. */
+
+Banner {
+    width: 100%;
+    height: auto;
+    padding: 1 2;
+    border: round $primary;
+}
+
+Butterfly {
+    width: auto;
+    height: auto;
+    margin-right: 3;
+}
+
+#banner-text {
+    width: 1fr;
+    height: 100%;
+    align-vertical: middle;
+}
+
+#banner-name {
+    text-style: bold;
+}
+
+#banner-tagline {
+    margin-bottom: 1;
+    color: $text-muted;
+}
+
+.-narrow Banner {
+    layout: vertical;
+}
+
+.-narrow #banner-text {
+    height: auto;
+    margin-top: 1;
+}
+
+/* The message box. */
+
+Input {
+    margin-right: 1;
+    border: round $primary;
+    background: $background;
+}
+
+Input:focus {
+    border: round $primary;
+    background-tint: $foreground 0%;
+}
+
+/* The status line. */
+
+StatusLine {
+    height: 1;
+    margin: 0 2 0 1;
+}
+
+#status-context {
+    width: auto;
+}
+
+#status-context.low {
+    color: $success;
+}
+
+#status-context.medium {
+    color: $warning;
+}
+
+#status-context.high {
+    color: $error;
+}
+
+#status-keys {
+    width: 1fr;
+    text-align: right;
+    color: $text-muted;
+}

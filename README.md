@@ -2,7 +2,7 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. The configuration, the loading of a local model (alone or split with RPC servers), generation with a local model and the screen exist. The conversation, API models, tools and history are not implemented yet.
+> **Status:** early development. The configuration, the loading of a local model (alone or split with RPC servers), generation with a local model, the conversation and the screen exist, but the screen is not connected to the conversation yet. API models, tools and history are not implemented yet.
 
 ## The idea
 
@@ -65,7 +65,7 @@ Everything is set through environment variables, in a `.env` file that stays out
 | `AGENT_CLI_RPC_SERVERS` | `ip:port` of the other machine. When empty, everything runs on a single machine. | No |
 | `AGENT_CLI_API_KEY` | Secret key of your OpenRouter account | For API models |
 | `AGENT_CLI_API_MODELS` | Names of the models on OpenRouter, written as OpenRouter lists them, separated by commas. The first one is the default. | For API models |
-| `AGENT_CLI_SYSTEM_PROMPT_PATH` | Path to a text file with the system prompt. A relative path starts at the project folder. When empty, the project's default prompt is used. | No |
+| `AGENT_CLI_SYSTEM_PROMPT_PATH` | Path to a text file with the system prompt. A relative path starts at the project folder. When empty, the project's default prompt is used. A file with no text is an error. | No |
 
 `/model` offers every model that is configured: the local one when `AGENT_CLI_MODEL_PATH` is filled in, and each name in `AGENT_CLI_API_MODELS`. The session starts on the local model when there is one, otherwise on the first API model.
 
@@ -81,6 +81,7 @@ Everything is set through environment variables, in a `.env` file that stays out
 | A single variable to split across two machines | If there is an address, it splits; if it is empty, it does not. A second on/off variable would store the same information twice and allow combinations that make no sense. |
 | API models as an opt-in | They allow comparing a local model with a hosted one in the same CLI, with the same conversation and the same tools. There is no variable to choose between the two: the CLI offers whatever is configured. When both are, the session starts on the local model, because with an API the conversation leaves the machine. |
 | OpenRouter as the only API | It serves models from almost every provider with a single key, and it reports the context size of each model, which the CLI needs to know where to cut the conversation. Most APIs do not report it. |
+| The oldest turns leave in a block when the context fills | Above 80% of the context, whole turns leave, oldest first, until the conversation takes about half of it. The model only reports the size of the whole context, so each message is taken to hold the share of it that matches the share of the text it holds. The system prompt never leaves, and neither does part of a turn. One block at a time, instead of one message every turn, keeps the start of the conversation the same for many turns, so llama.cpp reuses what it already processed. When the model refuses the conversation anyway, the message is sent again with no earlier turns; a message too long even alone is not sent, and the earlier turns left out to try it come back. |
 | Variables prefixed with `AGENT_CLI_` | The CLI only uses an API when a variable written for this CLI says so. A key exported for another tool, such as `OPENROUTER_API_KEY`, is never picked up by accident. |
 | Switching models inside the session | Different tasks suit different models, and loading a local model is slow, so restarting the CLI just to switch would waste that time. |
 | The same tools for every model | A model is chosen for how well it does the task, not for what it is allowed to do. |

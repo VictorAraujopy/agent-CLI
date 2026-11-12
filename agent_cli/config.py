@@ -7,20 +7,17 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-DEFAULT_CONTEXT_TOKENS = 8192
 PROJECT_FOLDER = Path(__file__).parent.parent
 
 
 @dataclass(frozen=True)
 class Settings:
-    """What the user configured. An empty variable becomes None, an empty tuple or, for the context, its default."""
+    """What the user configured. An empty variable becomes None or an empty tuple."""
 
     model_path: Path | None
     rpc_servers: tuple[str, ...]
-    api_base_url: str | None
     api_key: str | None = field(repr=False)
     api_models: tuple[str, ...]
-    context_tokens: int
     system_prompt_path: Path | None
 
 
@@ -53,27 +50,13 @@ def items_of(variables: Mapping[str, str], name: str) -> tuple[str, ...]:
     return tuple(item for item in items if item)
 
 
-def whole_number_or_default(variables: Mapping[str, str], name: str, default: int) -> int:
-    """Return a variable as a whole number above zero, or the default when it is empty or missing."""
-    value = text_or_none(variables, name)
-    if value is None:
-        return default
-    if not value.isdecimal() or int(value) == 0:
-        raise ValueError(f"{name} must be a whole number above zero, but it is {value!r}")
-    return int(value)
-
-
 def build_settings(variables: Mapping[str, str]) -> Settings:
     """Build the settings from the variables, giving each value its type."""
     return Settings(
         model_path=path_or_none(variables, "AGENT_CLI_MODEL_PATH"),
         rpc_servers=items_of(variables, "AGENT_CLI_RPC_SERVERS"),
-        api_base_url=text_or_none(variables, "AGENT_CLI_API_BASE_URL"),
         api_key=text_or_none(variables, "AGENT_CLI_API_KEY"),
         api_models=items_of(variables, "AGENT_CLI_API_MODELS"),
-        context_tokens=whole_number_or_default(
-            variables, "AGENT_CLI_CONTEXT_TOKENS", DEFAULT_CONTEXT_TOKENS
-        ),
         system_prompt_path=path_or_none(variables, "AGENT_CLI_SYSTEM_PROMPT_PATH"),
     )
 

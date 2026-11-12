@@ -14,7 +14,7 @@ import llama_cpp
 from llama_cpp import Llama
 
 ALL_LAYERS_ON_THE_GPU = -1
-CONTEXT_STEP_TOKENS = 256
+CONTEXT_THE_MODEL_WAS_TRAINED_WITH = 0
 SECONDS_TO_WAIT_FOR_A_SERVER = 5
 SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER = 15
 FOLDER_OF_THIS_PACKAGE = Path(__file__).parent.parent.parent
@@ -43,24 +43,6 @@ def open_without_touching_the_terminal(**options: Any) -> Llama:
         model = Llama(**options, verbose=True)
     model.verbose = False
     return model
-
-
-def trained_context_tokens(model_path: Path) -> int:
-    """Return the context size the model was trained with, read from the .gguf without its weights."""
-    description = open_without_touching_the_terminal(model_path=str(model_path), vocab_only=True)
-    architecture = description.metadata["general.architecture"]
-    trained_context = int(description.metadata[f"{architecture}.context_length"])
-    description.close()
-    return trained_context
-
-
-def usable_context_tokens(asked_tokens: int, trained_tokens: int) -> int:
-    """Return the largest context llama.cpp creates that passes neither the asked nor the trained size."""
-    # llama.cpp rounds any context up to a whole number of steps, so the limit is rounded down first.
-    # One step is the smallest context it creates.
-    limit = min(asked_tokens, trained_tokens)
-    whole_steps = max(limit // CONTEXT_STEP_TOKENS, 1)
-    return whole_steps * CONTEXT_STEP_TOKENS
 
 
 def host_and_port(server: str) -> tuple[str, int]:
@@ -163,10 +145,9 @@ def connect_rpc_servers(servers: Sequence[str]) -> None:
         register_server(server)
 
 
-def load_model(model_path: Path, context_tokens: int, rpc_servers: Sequence[str] = ()) -> Llama:
-    """Open the .gguf file and return the model, loaded and ready to generate."""
+def load_model(model_path: Path, rpc_servers: Sequence[str] = ()) -> Llama:
+    """Open the .gguf file and return the model, with the context it was trained with and ready to generate."""
     silence_llama_cpp()
-    context = usable_context_tokens(context_tokens, trained_context_tokens(model_path))
     connect_rpc_servers(rpc_servers)
     # Mapping the file makes this machine reserve all of it, including the layers that run on the
     # RPC servers. A model that is split is read into memory instead, so each machine holds its part.
@@ -174,6 +155,6 @@ def load_model(model_path: Path, context_tokens: int, rpc_servers: Sequence[str]
     return open_without_touching_the_terminal(
         model_path=str(model_path),
         n_gpu_layers=ALL_LAYERS_ON_THE_GPU,
-        n_ctx=context,
+        n_ctx=CONTEXT_THE_MODEL_WAS_TRAINED_WITH,
         use_mmap=map_the_file_into_memory,
     )

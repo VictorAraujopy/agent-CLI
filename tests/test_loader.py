@@ -23,8 +23,6 @@ from agent_cli.inference.loader import (
     host_and_port,
     load_model,
     register_server,
-    trained_context_tokens,
-    usable_context_tokens,
     wait_for_server,
 )
 
@@ -53,7 +51,6 @@ CONNECT_TWICE_AND_COUNT_THE_DEVICES_OF_THE_SERVER = (
     "loader.connect_rpc_servers((sys.argv[2],)); loader.connect_rpc_servers((sys.argv[2],)); "
     "print(loader.device_descriptions().count(sys.argv[2]))"
 )
-MORE_THAN_THE_SMALL_MODEL_WAS_TRAINED_WITH = 8192
 
 
 @pytest.fixture
@@ -133,7 +130,7 @@ def test_missing_file_is_refused(tmp_path: Path) -> None:
     """A path with no file raises an error that names the path."""
     missing_file = tmp_path / "missing.gguf"
     with pytest.raises(ValueError, match="missing.gguf"):
-        load_model(missing_file, 512)
+        load_model(missing_file)
 
 
 def test_file_that_is_not_a_model_is_refused(tmp_path: Path) -> None:
@@ -141,50 +138,32 @@ def test_file_that_is_not_a_model_is_refused(tmp_path: Path) -> None:
     not_a_model = tmp_path / "not-a-model.gguf"
     not_a_model.write_text("this is not a model")
     with pytest.raises(ValueError, match="not-a-model.gguf"):
-        load_model(not_a_model, 512)
+        load_model(not_a_model)
 
 
-def test_trained_context_is_read_from_the_file(small_model_file: Path) -> None:
-    """The context size the model was trained with comes from the .gguf file."""
-    assert trained_context_tokens(small_model_file) == SMALL_MODEL_TRAINED_CONTEXT
-
-
-def test_model_is_loaded_with_the_context_that_was_asked(small_model_file: Path) -> None:
-    """A real model loads with the asked context size and splits text into tokens."""
-    model = load_model(small_model_file, 512)
+def test_model_is_loaded_with_the_context_it_was_trained_with(small_model_file: Path) -> None:
+    """A real model loads with the context size stored in its .gguf and splits text into tokens."""
+    model = load_model(small_model_file)
     assert isinstance(model, Llama)
-    assert model.n_ctx() == 512
+    assert model.n_ctx() == SMALL_MODEL_TRAINED_CONTEXT
     assert len(model.tokenize(b"hello world")) > 0
 
 
-@pytest.mark.parametrize(
-    ("asked", "trained", "usable"),
-    [(8192, 2048, 2048), (512, 2048, 512), (1000, 32768, 768), (100, 2048, 256)],
-)
-def test_usable_context_is_a_whole_number_of_steps_within_both_limits(
-    asked: int, trained: int, usable: int
-) -> None:
-    """The context is rounded down to the step llama.cpp uses, and is never smaller than one step."""
-    assert usable_context_tokens(asked, trained) == usable
-
-
-def test_context_never_passes_the_one_that_was_asked(small_model_file: Path) -> None:
-    """Asking for a size between two steps gives the step below, not the one above."""
-    model = load_model(small_model_file, 1000)
-    assert model.n_ctx() == 768
-
-
-def test_context_never_passes_the_one_the_model_was_trained_with(small_model_file: Path) -> None:
-    """Asking for more context than the model was trained with gives the trained size."""
-    model = load_model(small_model_file, MORE_THAN_THE_SMALL_MODEL_WAS_TRAINED_WITH)
-    assert model.n_ctx() == SMALL_MODEL_TRAINED_CONTEXT
+def test_llama_cpp_is_asked_for_the_context_stored_in_the_gguf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The loader passes n_ctx=0, which tells llama.cpp to take the context size from the .gguf."""
+    options_given_to_llama_cpp = {}
+    monkeypatch.setattr(
+        loader, "open_without_touching_the_terminal", options_given_to_llama_cpp.update
+    )
+    load_model(Path("any.gguf"))
+    assert options_given_to_llama_cpp["n_ctx"] == 0
 
 
 def test_loading_writes_nothing_on_the_terminal(
     small_model_file: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """Loading stays silent, because anything written would land on top of the screen."""
-    load_model(small_model_file, MORE_THAN_THE_SMALL_MODEL_WAS_TRAINED_WITH)
+    load_model(small_model_file)
     written = capfd.readouterr()
     assert written.out == ""
     assert written.err == ""
@@ -194,7 +173,7 @@ def test_generating_writes_nothing_on_the_terminal(
     small_model_file: Path, capfd: pytest.CaptureFixture[str]
 ) -> None:
     """After a load the library stays silent, also when it reuses the start of the previous text."""
-    model = load_model(small_model_file, 512)
+    model = load_model(small_model_file)
     model.create_completion("Once upon a time", max_tokens=4)
     model.create_completion("Once upon a time", max_tokens=4)
     written = capfd.readouterr()
@@ -220,7 +199,7 @@ def test_loading_leaves_the_output_of_the_terminal_in_place(
 
     monkeypatch.setattr(loader, "silence_llama_cpp", listen_to_llama_cpp)
     try:
-        load_model(small_model_file, 512)
+        load_model(small_model_file)
     finally:
         llama_cpp.llama_log_set(loader.discard_message, ctypes.c_void_p(0))
     assert output_during_the_load
@@ -238,12 +217,11 @@ def test_model_split_with_rpc_servers_is_read_instead_of_mapped(
 ) -> None:
     """A split model is not mapped, so this machine reserves only the layers that run on it."""
     options_given_to_llama_cpp = {}
-    monkeypatch.setattr(loader, "trained_context_tokens", lambda model_path: 2048)
     monkeypatch.setattr(loader, "connect_rpc_servers", lambda servers: None)
     monkeypatch.setattr(
         loader, "open_without_touching_the_terminal", options_given_to_llama_cpp.update
     )
-    load_model(Path("any.gguf"), 512, rpc_servers)
+    load_model(Path("any.gguf"), rpc_servers)
     assert options_given_to_llama_cpp["use_mmap"] is file_is_mapped
 
 

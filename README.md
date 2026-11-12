@@ -1,14 +1,14 @@
 # agent-CLI
 
-A terminal agent that runs any GGUF model directly on your machine, or any model behind an OpenAI-compatible API. Models are configured through environment variables, and you switch between them without leaving the session.
+A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. The configuration, the loading of a local model (alone or split with RPC servers) and the screen exist. Generation, the conversation, API models, tools and history are not implemented yet.
+> **Status:** early development. The configuration, the loading of a local model (alone or split with RPC servers), generation with a local model and the screen exist. The conversation, API models, tools and history are not implemented yet.
 
 ## The idea
 
 - **Local first.** By default the CLI opens the model file and generates the response itself. There is no server and no API, and nothing leaves your machine.
 - **Any GGUF model.** The project was born to run ADA, the author's own model, but nothing in the code knows which model is running. Whatever changes from one model to another comes from outside, through an environment variable.
-- **An API when you want one.** The same CLI can instead send the conversation to any OpenAI-compatible API, such as OpenRouter or OpenAI. It is only used when you configure it, and when a local model is configured too, the session starts on the local one.
+- **OpenRouter when you want it.** The same CLI can instead send the conversation to a model on OpenRouter. It is only used when you configure it, and when a local model is configured too, the session starts on the local one.
 - **Switch models inside the session.** `/model` lists the models you configured, local and API, and switches between them. The conversation continues, and every model gets the same tools.
 - **An agent, not just a chat.** The model can ask for a tool (read a file, run a command), and the CLI is the one that executes it.
 - **Your own system prompt.** A variable points to a text file with the system prompt, so you change how the agent behaves without touching the code.
@@ -63,10 +63,8 @@ Everything is set through environment variables, in a `.env` file that stays out
 |---|---|---|
 | `AGENT_CLI_MODEL_PATH` | Path to the `.gguf` file. A relative path starts at the project folder. | For the local model |
 | `AGENT_CLI_RPC_SERVERS` | `ip:port` of the other machine. When empty, everything runs on a single machine. | No |
-| `AGENT_CLI_API_BASE_URL` | Base URL of an OpenAI-compatible API, for example `https://openrouter.ai/api/v1` | For API models |
-| `AGENT_CLI_API_KEY` | Secret key of your account on that API | For API models |
-| `AGENT_CLI_API_MODELS` | Names of the models on that API, separated by commas. The first one is the default. | For API models |
-| `AGENT_CLI_CONTEXT_TOKENS` | Size of the context, in tokens: the conversation and the reply have to fit in it. More tokens need more memory. A local model never gets more than the context it was trained with, and gets the value rounded down to a step of 256 tokens, the unit llama.cpp uses, and never less than one step. When empty, 8192 is used. | No |
+| `AGENT_CLI_API_KEY` | Secret key of your OpenRouter account | For API models |
+| `AGENT_CLI_API_MODELS` | Names of the models on OpenRouter, written as OpenRouter lists them, separated by commas. The first one is the default. | For API models |
 | `AGENT_CLI_SYSTEM_PROMPT_PATH` | Path to a text file with the system prompt. A relative path starts at the project folder. When empty, the project's default prompt is used. | No |
 
 `/model` offers every model that is configured: the local one when `AGENT_CLI_MODEL_PATH` is filled in, and each name in `AGENT_CLI_API_MODELS`. The session starts on the local model when there is one, otherwise on the first API model.
@@ -79,10 +77,11 @@ Everything is set through environment variables, in a `.env` file that stays out
 | GGUF models only, for local inference | It is the format in which practically every open model is distributed. A single loader covers all of them. |
 | Python with `llama-cpp-python` | Generation runs in C++ inside llama.cpp, so the language is not the bottleneck. Python organizes the conversation and the screen. |
 | Inference code written from scratch | Code written for one specific model carries that model's quirks (conversation format, tool format). Here nothing may depend on which model it is. |
+| Every model uses the context it was trained with | The context comes from the model, not from a setting: a local model gets the size stored in its `.gguf`, and an API model the size OpenRouter reports for it. llama.cpp reserves the memory of the whole context when a local model loads, so a model with a long context needs a machine with room for it. |
 | A single variable to split across two machines | If there is an address, it splits; if it is empty, it does not. A second on/off variable would store the same information twice and allow combinations that make no sense. |
 | API models as an opt-in | They allow comparing a local model with a hosted one in the same CLI, with the same conversation and the same tools. There is no variable to choose between the two: the CLI offers whatever is configured. When both are, the session starts on the local model, because with an API the conversation leaves the machine. |
-| The OpenAI API format | It is the format most providers accept, so a single client covers OpenRouter, OpenAI and others. |
-| Variables prefixed with `AGENT_CLI_` | The CLI only uses an API when a variable written for this CLI says so. A key exported for another tool, such as `OPENAI_API_KEY`, is never picked up by accident. |
+| OpenRouter as the only API | It serves models from almost every provider with a single key, and it reports the context size of each model, which the CLI needs to know where to cut the conversation. Most APIs do not report it. |
+| Variables prefixed with `AGENT_CLI_` | The CLI only uses an API when a variable written for this CLI says so. A key exported for another tool, such as `OPENROUTER_API_KEY`, is never picked up by accident. |
 | Switching models inside the session | Different tasks suit different models, and loading a local model is slow, so restarting the CLI just to switch would waste that time. |
 | The same tools for every model | A model is chosen for how well it does the task, not for what it is allowed to do. |
 | The system prompt in a text file, with its path in a variable | Each user writes their own without touching the code. A file takes a prompt of any size, which would be awkward to write and to read inside `.env`. |
@@ -122,8 +121,8 @@ CMAKE_ARGS="-DGGML_METAL=on -DGGML_RPC=on" pip install --no-cache-dir -r require
 ## Security
 
 - The `.env` file stays out of git. A machine address is private data, and an API key is a secret.
-- No path, address or key is written in the code.
-- An API model is only used when no local model is configured or when you pick one with `/model`. From then on, the conversation, including the system prompt, is sent to the API you configured.
+- No path, private address or key is written in the code. The only address in it is OpenRouter's.
+- An API model is only used when no local model is configured or when you pick one with `/model`. From then on, the conversation, including the system prompt, is sent to OpenRouter.
 - A system prompt with personal content belongs in a file that stays out of git.
 - Splitting across two machines is off by default, for the reason explained above.
 - The model only asks; the CLI is the one that executes. A tool that changes something (writing a file, running a command) asks for confirmation first.

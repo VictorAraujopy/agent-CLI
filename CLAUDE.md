@@ -1,10 +1,10 @@
 # agent-CLI
 
-Terminal agent in Python. By default it runs any GGUF model directly on the user's machine, loading the model in its own process through `llama-cpp-python`. As an opt-in, it can instead send the conversation to any OpenAI-compatible API. Which models are available, whether a local model is split across two machines and which system prompt file is used all come from environment variables. Inside the session, `/model` switches between the configured models, which all share the same conversation and the same tools.
+Terminal agent in Python. By default it runs any GGUF model directly on the user's machine, loading the model in its own process through `llama-cpp-python`. As an opt-in, it can instead send the conversation to a model on OpenRouter. Which models are available, whether a local model is split across two machines and which system prompt file is used all come from environment variables. Inside the session, `/model` switches between the configured models, which all share the same conversation and the same tools.
 
 The design and the reasons behind it are in `README.md`. The work plan and the decisions still open are in `PLANO.md` (local, not in git).
 
-Nothing in the code may depend on which model is running. In a review, point out anything that ties the CLI to ADA, to one specific model or to one specific API provider: a path, a name, a URL, a system prompt, a conversation format or a tool format fixed in the code.
+Nothing in the code may depend on which model is running. In a review, point out anything that ties the CLI to ADA or to one specific model: a path, a name, a URL, a system prompt, a conversation format or a tool format fixed in the code. The one exception is OpenRouter: it is the only API the CLI talks to, on purpose, so its address and its way of reporting a model's context size belong in the code.
 
 ## Roles
 

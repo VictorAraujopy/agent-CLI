@@ -7,26 +7,18 @@ from textual.widgets import Static
 
 from agent_cli.screen.theme import MUTED_MARKUP, UNLIT_MARKUP
 
-CONTEXT_LABEL = "context"
 KEY_HINTS = "ctrl+q quit"
-
 GAUGE_SEGMENT = "▊"
 GAUGE_SEGMENTS = 16
-
-LOW = "low"
-MEDIUM = "medium"
-HIGH = "high"
-MEDIUM_FROM = 0.60
-HIGH_FROM = 0.85
 
 
 def usage_level(context_used: float) -> str:
     """Return how full the context is, as one of the three levels the stylesheet colors."""
-    if context_used >= HIGH_FROM:
-        return HIGH
-    if context_used >= MEDIUM_FROM:
-        return MEDIUM
-    return LOW
+    if context_used >= 0.85:
+        return "high"
+    if context_used >= 0.60:
+        return "medium"
+    return "low"
 
 
 def gauge(context_used: float) -> str:
@@ -42,7 +34,7 @@ def context_text(context_used: float, tokens_in_context: int) -> str:
     """Return the label, the gauge, the percentage of the context in use and the tokens the conversation takes."""
     percent = round(context_used * 100)
     tokens = f"[{MUTED_MARKUP}]{tokens_in_context} tokens[/]"
-    return f"[{MUTED_MARKUP}]{CONTEXT_LABEL}[/]  {gauge(context_used)}  {percent}%  {tokens}"
+    return f"[{MUTED_MARKUP}]context[/]  {gauge(context_used)}  {percent}%  {tokens}"
 
 
 def key_hints(reply_in_progress: bool) -> str:

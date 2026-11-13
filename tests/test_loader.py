@@ -16,8 +16,6 @@ from llama_cpp import Llama
 
 from agent_cli.inference import loader
 from agent_cli.inference.loader import (
-    FOLDER_OF_THIS_PACKAGE,
-    SECONDS_TO_WAIT_FOR_A_SERVER,
     command_that_registers,
     connect_rpc_servers,
     host_and_port,
@@ -26,7 +24,6 @@ from agent_cli.inference.loader import (
     wait_for_server,
 )
 
-SMALL_MODEL_TRAINED_CONTEXT = 2048
 SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS = 60
 RPC_SERVER_OF_THIS_MACHINE = """
 import ctypes
@@ -45,12 +42,6 @@ library.ggml_backend_rpc_start_server.argtypes = [
 ]
 library.ggml_backend_rpc_start_server(sys.argv[1].encode(), None, 1, 1, processor)
 """
-CONNECT_TWICE_AND_COUNT_THE_DEVICES_OF_THE_SERVER = (
-    "import sys; sys.path.insert(0, sys.argv[1]); "
-    "from agent_cli.inference import loader; loader.silence_llama_cpp(); "
-    "loader.connect_rpc_servers((sys.argv[2],)); loader.connect_rpc_servers((sys.argv[2],)); "
-    "print(loader.device_descriptions().count(sys.argv[2]))"
-)
 
 
 @pytest.fixture
@@ -145,7 +136,7 @@ def test_model_is_loaded_with_the_context_it_was_trained_with(small_model_file: 
     """A real model loads with the context size stored in its .gguf and splits text into tokens."""
     model = load_model(small_model_file)
     assert isinstance(model, Llama)
-    assert model.n_ctx() == SMALL_MODEL_TRAINED_CONTEXT
+    assert model.n_ctx() == 2048
     assert len(model.tokenize(b"hello world")) > 0
 
 
@@ -257,7 +248,7 @@ def test_server_that_stays_silent_is_given_up_on_after_the_wait(
     monkeypatch.setattr(loader.socket, "create_connection", never_connect)
     with pytest.raises(ConnectionError, match="did not answer"):
         wait_for_server("10.0.0.2:50052")
-    assert waits_asked == [SECONDS_TO_WAIT_FOR_A_SERVER]
+    assert waits_asked == [5]
 
 
 def test_separate_process_runs_from_any_folder_and_reaches_llama_cpp(
@@ -292,12 +283,18 @@ def test_separate_process_ignores_modules_of_the_folder_it_runs_in(
 
 def test_connected_server_becomes_one_device_of_llama_cpp(rpc_server_of_this_machine: str) -> None:
     """Connecting a real RPC server makes it a device of llama.cpp, once, however often it is connected."""
+    connect_twice_and_count_the_devices_of_the_server = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from agent_cli.inference import loader; loader.silence_llama_cpp(); "
+        "loader.connect_rpc_servers((sys.argv[2],)); loader.connect_rpc_servers((sys.argv[2],)); "
+        "print(loader.device_descriptions().count(sys.argv[2]))"
+    )
     command = [
         sys.executable,
         "-P",
         "-c",
-        CONNECT_TWICE_AND_COUNT_THE_DEVICES_OF_THE_SERVER,
-        str(FOLDER_OF_THIS_PACKAGE),
+        connect_twice_and_count_the_devices_of_the_server,
+        str(Path(__file__).parent.parent),
         rpc_server_of_this_machine,
     ]
     finished = subprocess.run(

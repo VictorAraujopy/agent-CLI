@@ -8,8 +8,6 @@ from textual.widgets.markdown import MarkdownStream
 
 from agent_cli.inference.model import THINKING_CLOSES, THINKING_OPENS
 
-USER_MARK = ">"
-
 
 class UserMessage(Horizontal):
     """A message the user sent: a mark on the left and the text beside it."""
@@ -21,7 +19,7 @@ class UserMessage(Horizontal):
 
     def compose(self) -> ComposeResult:
         """Yield the mark and the text, shown exactly as it was typed."""
-        yield Static(USER_MARK, classes="user-mark")
+        yield Static(">", classes="user-mark")
         # markup=False: a square bracket the user typed is text, not the start of a style tag.
         yield Static(self.text, classes="user-text", markup=False)
 

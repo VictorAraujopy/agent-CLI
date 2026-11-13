@@ -21,8 +21,6 @@ from agent_cli.inference.loader import (
     memory_another_context_takes,
 )
 
-SMALL_MODEL_TRAINED_CONTEXT = 2048
-BYTES_A_MEASUREMENT_MAY_BE_OFF = 1024**2
 
 
 class LibraryWithOneDevice:
@@ -111,7 +109,7 @@ def test_llama_cpp_itself_tells_the_free_memory_of_its_devices() -> None:
 def test_small_model_is_measured_on_the_devices_that_hold_its_context(small_model_file: Path) -> None:
     """The measurement gives the trained context, and on each device of the context a cost for every token."""
     memory_use = measure_memory_use(small_model_file)
-    assert memory_use.trained_context == SMALL_MODEL_TRAINED_CONTEXT
+    assert memory_use.trained_context == 2048
     skip_without_a_gpu()
     assert memory_use.devices != ()
     for device in memory_use.devices:
@@ -126,7 +124,7 @@ def test_measuring_gives_back_the_memory_it_took(small_model_file: Path) -> None
     measure_memory_use(small_model_file)
     free_after = free_memory_by_device()
     for device, free_bytes in free_before.items():
-        assert abs(free_after[device] - free_bytes) < BYTES_A_MEASUREMENT_MAY_BE_OFF
+        assert abs(free_after[device] - free_bytes) < 1024**2
 
 
 def test_measurement_connects_the_servers_and_loads_the_model_split_with_them(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -4,4 +4,5 @@
 llama-cpp-python==0.3.35  # loads the .gguf and generates the text; the Python bridge to llama.cpp
 textual==8.2.8  # draws the screen and reads the keyboard; the terminal application framework
 python-dotenv==1.2.4  # reads the .env file; the parser for the KEY=value format
+httpx==0.28.1  # sends the conversation to OpenRouter and reads the reply as it arrives; the HTTP client
 pytest==9.2.0  # runs the tests; the test runner

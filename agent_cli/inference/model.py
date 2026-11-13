@@ -3,8 +3,6 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
-# How a reply marks what the model thought before it answered: the reply starts with the thinking, between
-# these two tags, and the answer comes after them. Models of several families write their thinking this way.
 THINKING_OPENS = "<think>"
 THINKING_CLOSES = "</think>"
 
@@ -35,3 +33,19 @@ class Model(ABC):
     @abstractmethod
     def context_limit(self) -> int:
         """Return how many tokens the conversation may take: the size of the model's context."""
+
+    @abstractmethod
+    def thinking_options(self) -> tuple[str, ...]:
+        """Return the choices this model has for how much it thinks before it answers."""
+
+    @abstractmethod
+    def thinking(self) -> str:
+        """Return the choice in use, one of the thinking options."""
+
+    @abstractmethod
+    def set_thinking(self, option: str) -> None:
+        """Choose how much the model thinks before the replies that follow: one of its thinking options."""
+
+    @abstractmethod
+    def close(self) -> None:
+        """Free what the model holds; the model is not used after this."""

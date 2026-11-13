@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_cli.agent.prompt import DEFAULT_SYSTEM_PROMPT_FILE, read_system_prompt
+from agent_cli.agent.prompt import read_system_prompt
 
 
 def test_configured_file_gives_its_text(tmp_path: Path) -> None:
@@ -17,7 +17,8 @@ def test_configured_file_gives_its_text(tmp_path: Path) -> None:
 
 def test_default_file_is_used_when_none_is_configured() -> None:
     """With no file configured, the system prompt is the text of the project's default file."""
-    default_text = DEFAULT_SYSTEM_PROMPT_FILE.read_text(encoding="utf-8").strip()
+    default_file = Path(__file__).parent.parent / "agent_cli" / "agent" / "default_system_prompt.md"
+    default_text = default_file.read_text(encoding="utf-8").strip()
     assert read_system_prompt(None) == default_text
 
 

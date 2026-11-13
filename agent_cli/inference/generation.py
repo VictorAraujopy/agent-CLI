@@ -14,9 +14,6 @@ from llama_cpp.llama_chat_format import (
 
 from agent_cli.inference.model import THINKING_OPENS, ContextFullError, Model
 
-CHAT_TEMPLATE_IN_THE_GGUF = "tokenizer.chat_template"
-NO_SUCH_TOKEN = -1
-
 
 def says_context_is_full(error: ValueError) -> bool:
     """Tell whether an error of the library says the conversation does not fit in the context."""
@@ -26,14 +23,14 @@ def says_context_is_full(error: ValueError) -> bool:
 
 def token_text(llama: Llama, token: int) -> str:
     """Return the text of a token of the model, or no text when the model does not have that token."""
-    if token == NO_SUCH_TOKEN:
+    if token == -1:
         return ""
     return llama.detokenize([token], special=True).decode()
 
 
 def formatter_of_the_template(llama: Llama) -> Jinja2ChatFormatter | None:
     """Return what formats a conversation with the chat template stored in the .gguf, or None when it stores none."""
-    template = llama.metadata.get(CHAT_TEMPLATE_IN_THE_GGUF)
+    template = llama.metadata.get("tokenizer.chat_template")
     if template is None:
         return None
     end_token = llama.token_eos()
@@ -62,6 +59,7 @@ class LocalModel(Model):
         # Whether the template opened the thinking at the end of the last conversation it formatted. The
         # reply then starts inside the thinking, without the opening tag, which is in what the model read.
         self.template_opened_the_thinking = False
+        self.thinking_is_on = True
         # The library formats the conversation without telling the template to let the model think. With
         # the template of the .gguf, the model formats it here instead. A model with no template keeps
         # the format the library chose for it.
@@ -70,12 +68,24 @@ class LocalModel(Model):
             llama.chat_handler = chat_formatter_to_chat_completion_handler(self.format_with_thinking)
 
     def format_with_thinking(self, **conversation: Any) -> ChatFormatterResponse:
-        """Format the conversation with the model's template, told to let the model think before it answers."""
+        """Format the conversation with the model's template, told whether the model may think before it answers."""
         # enable_thinking is the name the templates that can turn the thinking off give to the switch;
         # a template that has no such switch ignores it.
-        formatted = cast(Jinja2ChatFormatter, self.formatter)(**conversation, enable_thinking=True)
+        formatted = cast(Jinja2ChatFormatter, self.formatter)(**conversation, enable_thinking=self.thinking_is_on)
         self.template_opened_the_thinking = formatted.prompt.rstrip().endswith(THINKING_OPENS)
         return formatted
+
+    def thinking_options(self) -> tuple[str, ...]:
+        """Return the choices for the thinking of a local model: on or off, the switch a chat template has."""
+        return ("on", "off")
+
+    def thinking(self) -> str:
+        """Return whether the model may think before the replies that follow: on or off."""
+        return "on" if self.thinking_is_on else "off"
+
+    def set_thinking(self, option: str) -> None:
+        """Choose whether the model thinks before the replies that follow: on or off."""
+        self.thinking_is_on = option == "on"
 
     def reply(self, messages: list[dict[str, str]]) -> Iterator[str]:
         """Yield the reply to the conversation one piece of text at a time, as the model writes it."""
@@ -146,3 +156,7 @@ class LocalModel(Model):
         created_context = self.llama.n_ctx()
         trained_context = llama_cpp.llama_model_n_ctx_train(self.llama.model)
         return min(created_context, trained_context)
+
+    def close(self) -> None:
+        """Free the memory the model takes, on this machine and on the RPC servers it is split with."""
+        self.llama.close()

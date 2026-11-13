@@ -18,8 +18,6 @@ from agent_cli.screen.messages import Notice, TurnView
 from agent_cli.screen.status import StatusLine
 from agent_cli.screen.theme import THEME_NAME, build_theme
 
-WIDE_FROM_COLUMNS = 80
-
 
 class Activity(Enum):
     """What the session is doing now. The value of each one is what the message box says meanwhile."""
@@ -35,7 +33,7 @@ class AgentCliApp(App):
 
     CSS_PATH = "app.tcss"
     AUTO_FOCUS = "Input"
-    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (WIDE_FROM_COLUMNS, "-wide")]
+    HORIZONTAL_BREAKPOINTS = [(0, "-narrow"), (80, "-wide")]
     BINDINGS = [("escape", "stop_reply", "Stop the reply")]
 
     # What the background threads tell the screen. A thread never touches the screen: it posts one of

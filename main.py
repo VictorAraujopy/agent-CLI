@@ -10,22 +10,12 @@ from agent_cli.inference.loader import DeviceMemory, MemoryUse, load_model, meas
 from agent_cli.inference.model import Model
 from agent_cli.screen.app import AgentCliApp
 
-# Bytes left free on each device, for whatever else uses it and for the small errors of the measurement.
-# Half a GiB: a whole GiB left no room for a context on a 6 GB card that holds 4 GiB of a large model's weights.
-MEMORY_LEFT_FREE_ON_EACH_DEVICE = 512 * 1024**2
-# Tokens. With less than this a conversation ends after a few messages, so the model is refused instead.
-SMALLEST_CONTEXT_WORTH_LOADING = 4096
-# llama.cpp creates contexts in steps of this many tokens.
-CONTEXT_STEP = 256
-
 
 def tokens_that_fit_on(device: DeviceMemory) -> int:
     """Return how many tokens of context fit in what the device has free once the model's weights are on it."""
+    memory_left_free = 512 * 1024**2
     memory_for_the_context = (
-        device.free_before_the_model
-        - MEMORY_LEFT_FREE_ON_EACH_DEVICE
-        - device.model_weights
-        - device.any_context
+        device.free_before_the_model - memory_left_free - device.model_weights - device.any_context
     )
     return int(memory_for_the_context / device.each_context_token)
 
@@ -36,8 +26,8 @@ def context_that_fits(memory_use: MemoryUse) -> int:
     for device in memory_use.devices:
         context = min(context, tokens_that_fit_on(device))
     if context < memory_use.trained_context:
-        context = context // CONTEXT_STEP * CONTEXT_STEP
-    smallest_acceptable = min(memory_use.trained_context, SMALLEST_CONTEXT_WORTH_LOADING)
+        context = context // 256 * 256
+    smallest_acceptable = min(memory_use.trained_context, 4096)
     if context < smallest_acceptable:
         raise RuntimeError(
             "the model does not fit in the free memory: "

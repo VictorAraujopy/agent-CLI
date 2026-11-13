@@ -14,7 +14,6 @@ SMALL_MODEL_URL = (
 )
 SMALL_MODEL_SHA256 = "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
 SMALL_MODEL_FILE = Path(__file__).parent.parent / "storage" / "models" / "stories260K-f32.gguf"
-DOWNLOAD_TIMEOUT_SECONDS = 30
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -43,7 +42,7 @@ def small_model_is_ready() -> bool:
 def download_small_model() -> bytes:
     """Download the small model and return its content, failing the test when the download fails."""
     try:
-        with urlopen(SMALL_MODEL_URL, timeout=DOWNLOAD_TIMEOUT_SECONDS) as response:
+        with urlopen(SMALL_MODEL_URL, timeout=30) as response:
             return response.read()
     except OSError as error:
         pytest.fail(f"could not download the small test model from {SMALL_MODEL_URL}: {error}")

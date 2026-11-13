@@ -5,10 +5,6 @@ from dataclasses import dataclass
 
 from agent_cli.inference.model import ContextFullError, Model
 
-# Shares of the model's context, from 0 to 1.
-CUT_WHEN_ABOVE = 0.8
-CUT_DOWN_TO = 0.5
-
 
 class MessageTooLongError(Exception):
     """The user's message does not fit in the model's context, even with every earlier turn left out."""
@@ -51,11 +47,11 @@ class Conversation:
 
     def is_full(self, context_limit: int) -> bool:
         """Tell whether the conversation passed the share of the context where the cut starts."""
-        return self.tokens_in_context > context_limit * CUT_WHEN_ABOVE
+        return self.tokens_in_context > context_limit * 0.8
 
     def cut_oldest_turns(self, context_limit: int) -> None:
         """Drop the oldest turns until the conversation takes at most the share kept after a cut."""
-        tokens_to_keep = context_limit * CUT_DOWN_TO
+        tokens_to_keep = context_limit * 0.5
         # The model only counts the whole context, so each message is taken to hold the share of the tokens
         # that matches the share of the text it holds.
         tokens_per_character = self.tokens_in_context / characters_in(self.messages())

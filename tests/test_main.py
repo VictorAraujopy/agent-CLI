@@ -11,7 +11,6 @@ from agent_cli.inference.loader import DeviceMemory, MemoryUse
 
 SMALL_MODEL_TRAINED_CONTEXT = 2048
 GIB = 1024**3
-MIB = 1024**2
 
 
 class ScreenThatClosedWithAnError:
@@ -37,7 +36,7 @@ def device_with(free_gib: float, weights_gib: float = 0, any_context_gib: float 
         free_before_the_model=round(free_gib * GIB),
         model_weights=round(weights_gib * GIB),
         any_context=round(any_context_gib * GIB),
-        each_context_token=float(MIB),
+        each_context_token=float(1024**2),
     )
 
 

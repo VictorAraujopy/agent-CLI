@@ -13,13 +13,11 @@ from agent_cli.inference.model import ContextFullError
 
 STORY_START = [{"role": "user", "content": "Once upon a time"}]
 TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
-# Like the templates of the models that think: it opens the thinking only when told to let the model think.
 TEMPLATE_WITH_A_THINKING_SWITCH = (
     TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES
     + "{% if enable_thinking is defined and enable_thinking is true %}<think>\n{% endif %}"
 )
 PIECES_TO_READ = 5
-TOKENS_LEFT_FREE = 64
 
 
 @pytest.fixture(scope="module")
@@ -52,6 +50,45 @@ def test_reply_gets_no_opening_tag_when_the_template_opens_no_thinking(small_mod
     assert "<think>" not in first_piece
 
 
+def test_template_is_told_not_to_let_the_model_think_when_the_thinking_is_off(small_model_file: Path) -> None:
+    """With the thinking off, the template opens no thinking and the reply gets no opening tag."""
+    model = model_with_template(small_model_file, TEMPLATE_WITH_A_THINKING_SWITCH)
+    model.set_thinking("off")
+    first_piece = next(model.reply(STORY_START))
+    model.stop()
+    assert "<think>" not in first_piece
+
+
+def test_thinking_turned_back_on_lets_the_model_think_again(small_model_file: Path) -> None:
+    """The thinking that was turned off is turned on again, and the reply starts with the opening tag."""
+    model = model_with_template(small_model_file, TEMPLATE_WITH_A_THINKING_SWITCH)
+    model.set_thinking("off")
+    model.set_thinking("on")
+    first_piece = next(model.reply(STORY_START))
+    model.stop()
+    assert first_piece == "<think>\n"
+
+
+def test_local_model_offers_its_thinking_on_or_off_and_starts_with_it_on(local_model: LocalModel) -> None:
+    """A local model has two choices for its thinking, tells the one in use and starts with it on."""
+    assert local_model.thinking_options() == ("on", "off")
+    assert local_model.thinking() == "on"
+    local_model.set_thinking("off")
+    assert local_model.thinking() == "off"
+    local_model.set_thinking("on")
+
+
+def test_closing_a_local_model_frees_the_model_of_the_library(
+    small_model_file: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing the model closes the one the library loaded, which is what gives the memory back."""
+    model = LocalModel(load_model(small_model_file))
+    closings: list[str] = []
+    monkeypatch.setattr(model.llama, "close", lambda: closings.append("closed"))
+    model.close()
+    assert closings == ["closed"]
+
+
 def test_template_gets_the_texts_of_the_start_and_end_tokens(small_model_file: Path) -> None:
     """The template is formatted with the model's own start and end tokens, and a token the model lacks has no text."""
     model = model_with_template(small_model_file, TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES)
@@ -79,7 +116,7 @@ def conversation_with_little_room_left(model: LocalModel) -> list[dict[str, str]
     """Return a conversation that fills the model's context but for a few dozen tokens."""
     sample = "Once upon a time " * 100
     tokens_per_repeat = len(model.llama.tokenize(sample.encode(), add_bos=False)) / 100
-    repeats = int((model.context_limit() - TOKENS_LEFT_FREE) / tokens_per_repeat)
+    repeats = int((model.context_limit() - 64) / tokens_per_repeat)
     return [{"role": "user", "content": "Once upon a time " * repeats}]
 
 

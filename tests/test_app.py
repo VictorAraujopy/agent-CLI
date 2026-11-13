@@ -41,6 +41,8 @@ class ScriptedModel(Model):
         self.stop_asked = threading.Event()
         self.conversations_received: list[list[dict[str, str]]] = []
         self.tokens = 0
+        self.thinking_option = "on"
+        self.was_closed = False
 
     def reply(self, messages: list[dict[str, str]]) -> Iterator[str]:
         """Refuse a conversation that passes the limit, or yield the pieces, then fail if a failure was set."""
@@ -64,6 +66,22 @@ class ScriptedModel(Model):
     def allow_piece(self) -> None:
         """Let a reply that is being held write its next piece."""
         self.pieces_allowed.release()
+
+    def thinking_options(self) -> tuple[str, ...]:
+        """Return the choices of a model whose thinking is only turned on or off."""
+        return ("on", "off")
+
+    def thinking(self) -> str:
+        """Return the choice in use."""
+        return self.thinking_option
+
+    def set_thinking(self, option: str) -> None:
+        """Keep the choice, for the test to look at."""
+        self.thinking_option = option
+
+    def close(self) -> None:
+        """Remember that the model was closed."""
+        self.was_closed = True
 
     def stop(self) -> None:
         """End the reply at its next piece, also when that piece is being held."""

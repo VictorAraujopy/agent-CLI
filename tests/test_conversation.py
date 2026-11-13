@@ -13,7 +13,6 @@ from agent_cli.inference.model import ContextFullError, Model
 
 SYSTEM_PROMPT = "Be brief."
 SYSTEM_MESSAGE = {"role": "system", "content": SYSTEM_PROMPT}
-PIECES_TO_READ = 3
 
 
 @pytest.fixture(scope="module")
@@ -55,6 +54,20 @@ class FakeModel(Model):
         """Return the characters of the last conversation and of the reply written so far."""
         self.events.append("tokens counted")
         return self.tokens
+
+    def thinking_options(self) -> tuple[str, ...]:
+        """Return no choices: the fake does not think."""
+        return ()
+
+    def thinking(self) -> str:
+        """Return no choice: the fake does not think."""
+        return ""
+
+    def set_thinking(self, option: str) -> None:
+        """Do nothing: the fake does not think."""
+
+    def close(self) -> None:
+        """Do nothing: the fake holds nothing."""
 
     def stop(self) -> None:
         """Do nothing: the tests end the fake's reply by closing it."""
@@ -284,7 +297,7 @@ def test_conversation_that_does_not_fit_the_real_local_model_is_sent_again_witho
     huge_question = "Once upon a time " * local_model.context_limit()
     conversation.add_turn(exchange(huge_question, "The end."), tokens_in_context_after_reply=10)
     reply = conversation.run_turn(local_model, "Once upon a time")
-    list(islice(reply, PIECES_TO_READ))
+    list(islice(reply, 3))
     reply.close()
     assert conversation.messages()[:2] == [SYSTEM_MESSAGE, user("Once upon a time")]
     assert len(conversation.messages()) == 3

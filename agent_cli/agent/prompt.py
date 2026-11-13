@@ -2,13 +2,11 @@
 
 from pathlib import Path
 
-DEFAULT_SYSTEM_PROMPT_FILE = Path(__file__).parent / "default_system_prompt.md"
-
 
 def system_prompt_file(configured_file: Path | None) -> Path:
     """Return the file the system prompt comes from: the configured one, or the default when none is."""
     if configured_file is None:
-        return DEFAULT_SYSTEM_PROMPT_FILE
+        return Path(__file__).parent / "default_system_prompt.md"
     return configured_file
 
 

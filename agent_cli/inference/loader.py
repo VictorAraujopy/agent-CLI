@@ -14,19 +14,10 @@ from typing import Any
 import llama_cpp
 from llama_cpp import Llama
 
-ALL_LAYERS_ON_THE_GPU = -1
-CONTEXT_THE_MODEL_WAS_TRAINED_WITH = 0
-# Context sizes of the measurement, in tokens. Small, so that measuring takes little memory even of a large model.
 PROBE_CONTEXT = 1024
 SMALLER_EXTRA_CONTEXT = 2048
 LARGER_EXTRA_CONTEXT = 4096
-SECONDS_TO_WAIT_FOR_A_SERVER = 5
 SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER = 15
-FOLDER_OF_THIS_PACKAGE = Path(__file__).parent.parent.parent
-REGISTER_A_SERVER_IN_A_NEW_PROCESS = (
-    "import sys; sys.path.insert(0, sys.argv[1]); "
-    "from agent_cli.inference.loader import register_server; register_server(sys.argv[2])"
-)
 
 
 @dataclass(frozen=True)
@@ -81,7 +72,7 @@ def wait_for_server(server: str) -> None:
     """Fail with a clear error when an RPC server does not answer within a few seconds."""
     address = host_and_port(server)
     try:
-        with socket.create_connection(address, timeout=SECONDS_TO_WAIT_FOR_A_SERVER):
+        with socket.create_connection(address, timeout=5):
             pass
     except OSError as error:
         raise ConnectionError(f"the RPC server {server} did not answer: {error}") from error
@@ -133,9 +124,13 @@ def device_descriptions() -> list[str]:
 
 def command_that_registers(server: str) -> list[str]:
     """Return the command of a separate process that does nothing but try to register the server."""
+    code = (
+        "import sys; sys.path.insert(0, sys.argv[1]); "
+        "from agent_cli.inference.loader import register_server; register_server(sys.argv[2])"
+    )
+    folder_of_this_package = Path(__file__).parent.parent.parent
     # -P keeps the folder the program was called from out of the places Python imports from.
-    code = REGISTER_A_SERVER_IN_A_NEW_PROCESS
-    return [sys.executable, "-P", "-c", code, str(FOLDER_OF_THIS_PACKAGE), server]
+    return [sys.executable, "-P", "-c", code, str(folder_of_this_package), server]
 
 
 def confirm_server_speaks_rpc(server: str) -> None:
@@ -181,7 +176,7 @@ def open_model(model_path: Path, rpc_servers: Sequence[str], context_tokens: int
     map_the_file_into_memory = not rpc_servers
     return open_without_touching_the_terminal(
         model_path=str(model_path),
-        n_gpu_layers=ALL_LAYERS_ON_THE_GPU,
+        n_gpu_layers=-1,
         n_ctx=context_tokens,
         use_mmap=map_the_file_into_memory,
         # Without flash attention llama.cpp keeps a table of attention scores that grows with the context:
@@ -262,10 +257,8 @@ def confirm_devices_hold(model: Llama) -> None:
             raise RuntimeError(f"the model takes more memory than {device} has: its context has to be smaller")
 
 
-def load_model(
-    model_path: Path, rpc_servers: Sequence[str] = (), context_tokens: int = CONTEXT_THE_MODEL_WAS_TRAINED_WITH
-) -> Llama:
-    """Open the .gguf file and return the model, ready to generate, with a context of the given size."""
+def load_model(model_path: Path, rpc_servers: Sequence[str] = (), context_tokens: int = 0) -> Llama:
+    """Open the .gguf file and return the model, ready to generate, with the given context, or the trained one if 0."""
     silence_llama_cpp()
     connect_rpc_servers(rpc_servers)
     model = open_model(model_path, rpc_servers, context_tokens)

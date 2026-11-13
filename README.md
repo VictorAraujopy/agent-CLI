@@ -2,7 +2,7 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. The configuration, the loading of a local model (alone or split with RPC servers), generation with a local model, the conversation and the screen exist, but the screen is not connected to the conversation yet. API models, tools and history are not implemented yet.
+> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. API models, `/model`, tools and history are not implemented yet.
 
 ## The idea
 
@@ -77,7 +77,9 @@ Everything is set through environment variables, in a `.env` file that stays out
 | GGUF models only, for local inference | It is the format in which practically every open model is distributed. A single loader covers all of them. |
 | Python with `llama-cpp-python` | Generation runs in C++ inside llama.cpp, so the language is not the bottleneck. Python organizes the conversation and the screen. |
 | Inference code written from scratch | Code written for one specific model carries that model's quirks (conversation format, tool format). Here nothing may depend on which model it is. |
-| Every model uses the context it was trained with | The context comes from the model, not from a setting: a local model gets the size stored in its `.gguf`, and an API model the size OpenRouter reports for it. llama.cpp reserves the memory of the whole context when a local model loads, so a model with a long context needs a machine with room for it. |
+| A local model gets the largest context its machines hold, never above the one it was trained with | The context is not a setting: nobody should need to know that number to use a model. llama.cpp reserves the memory of the whole context when a model loads, and recent models are trained with contexts that take more memory than most machines have. So when the session opens, the CLI loads the model once with a small context and measures, on this machine's GPU and on each RPC server, how much memory the weights take and how much each token of context takes. From what each device has free it computes the largest context that fits, leaving half a GiB free on each, and loads the model with it. A model that leaves room for fewer than 4096 tokens is refused with an error instead; one trained with less than that only has to fit whole. Two limits come from what llama.cpp reports. A machine with no GPU is not measured, so there the model gets the context it was trained with. And on a Mac the free memory counts only what the CLI itself holds, not what other programs use: a second session opened beside the first sizes its context as if it were alone. An API model gets the size OpenRouter reports for it. |
+| A model that can think is told to think | The chat template of some models has a switch, `enable_thinking`, that lets the model write its thinking before the answer; the CLI formats the conversation with the model's own template and turns that switch on. A template with no such switch ignores it. The thinking arrives at the start of the reply, between `<think>` and `</think>`, the marks models of several families use; they are the only format fixed in the code, and the screen uses them to show the thinking apart from the answer. A small model may never end its thinking: `esc` stops it. |
+| Flash attention is always on | Without it llama.cpp keeps a table of attention scores that grows with the context. A long context then takes far more memory, and each token no longer takes a fixed amount, so the context that fits could not be computed from a small measurement. One case is known not to work: llama.cpp does not ask an RPC server what it can compute, so a server whose backend has no flash attention for the size of the model's attention heads stops at the first reply, and the session stops with it. |
 | A single variable to split across two machines | If there is an address, it splits; if it is empty, it does not. A second on/off variable would store the same information twice and allow combinations that make no sense. |
 | API models as an opt-in | They allow comparing a local model with a hosted one in the same CLI, with the same conversation and the same tools. There is no variable to choose between the two: the CLI offers whatever is configured. When both are, the session starts on the local model, because with an API the conversation leaves the machine. |
 | OpenRouter as the only API | It serves models from almost every provider with a single key, and it reports the context size of each model, which the CLI needs to know where to cut the conversation. Most APIs do not report it. |
@@ -92,9 +94,11 @@ Everything is set through environment variables, in a `.env` file that stays out
 
 A local model has to be loaded into memory, and it leaves memory when the CLI closes. That is why the CLI is a **session you enter and stay in**, not a command you call for each question. Every open terminal loads the model again.
 
+Opening a session loads the model twice: first with a small context, to measure the memory it takes, then with the context that fits. On one machine the second load reuses what the system has just read from disk. Split across two machines it adds a few seconds.
+
 ## Running on two machines
 
-When the model does not fit on one machine, llama.cpp can split its layers with another one over the network (RPC). This works for any GGUF, and by default llama.cpp divides the layers according to the free memory of each machine.
+When the model does not fit on one machine, llama.cpp can split its layers with another one over the network (RPC). This works for any GGUF, with the one exception described under flash attention in the design decisions, and by default llama.cpp divides the layers according to the free memory of each machine.
 
 The other machine must be running `ggml-rpc-server`, a program that ships with llama.cpp. The CLI does not start it for you.
 
@@ -115,9 +119,30 @@ Requires Python 3.12.
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 CMAKE_ARGS="-DGGML_METAL=on -DGGML_RPC=on" pip install --no-cache-dir -r requirements.txt
+pip install -e .
 ```
 
 `--no-cache-dir` forces pip to compile again instead of reusing an old build made with a different flag.
+
+`pip install -e .` creates the `agentcli` command. It runs the code of this folder and reads the `.env` of this folder, whatever directory you call it from.
+
+## Running
+
+With the virtual environment active:
+
+```bash
+agentcli
+```
+
+The screen opens at once and the model loads in the background; the message box unlocks when it is ready. The banner then shows the model and the context it got, in tokens.
+
+| Key | What it does |
+|---|---|
+| `enter` | Sends the message. |
+| `esc` | Stops the reply being written. What was written stays in the conversation. |
+| `ctrl+q` | Quits. During the load of the model, the session closes as soon as the load ends. |
+
+What the model thinks before it answers is shown above the reply, in a muted color. The status line shows how much of the model's context the conversation takes, as a share and in tokens.
 
 ## Security
 

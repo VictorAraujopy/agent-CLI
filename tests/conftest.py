@@ -1,6 +1,8 @@
-"""Shared test setup: provides the small model the tests load, downloading it when it is missing."""
+"""Shared test setup: provides the small model the tests load, and runs the tests written as coroutines."""
 
+import asyncio
 import hashlib
+import inspect
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -13,6 +15,17 @@ SMALL_MODEL_URL = (
 SMALL_MODEL_SHA256 = "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
 SMALL_MODEL_FILE = Path(__file__).parent.parent / "storage" / "models" / "stories260K-f32.gguf"
 DOWNLOAD_TIMEOUT_SECONDS = 30
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
+    """Run a test written as a coroutine to its end; pytest alone would only create it, and nothing would run."""
+    if not inspect.iscoroutinefunction(pyfuncitem.obj):
+        return None
+    fixture_names = inspect.signature(pyfuncitem.obj).parameters
+    fixtures = {name: pyfuncitem.funcargs[name] for name in fixture_names}
+    asyncio.run(pyfuncitem.obj(**fixtures))
+    return True
 
 
 def sha256_of(content: bytes) -> str:

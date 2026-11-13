@@ -13,6 +13,14 @@ Screen {
     scrollbar-size-vertical: 1;
 }
 
+/* Textual keeps an area scrolled to its end by pushing content shorter than the area to the bottom.
+   The content is never shorter than the area, so the banner stays at the top. */
+
+#conversation-content {
+    height: auto;
+    min-height: 100%;
+}
+
 /* The banner. */
 
 Banner {
@@ -52,6 +60,79 @@ Butterfly {
     margin-top: 1;
 }
 
+/* The conversation: each turn, with the user's message and the reply, and the notices. */
+
+TurnView {
+    height: auto;
+    margin-top: 1;
+}
+
+UserMessage {
+    height: auto;
+}
+
+.user-mark {
+    width: 2;
+    color: $primary;
+    text-style: bold;
+}
+
+/* The same two free columns on the right as the reply, so both wrap at the same column. */
+
+.user-text {
+    width: 1fr;
+    padding-right: 2;
+}
+
+/* The thinking takes no room until the model writes some. It keeps the same two columns free on each
+   side as the reply. */
+
+Thinking {
+    display: none;
+    height: auto;
+    margin: 1 2 0 2;
+    color: $text-muted;
+}
+
+Reply {
+    margin-top: 1;
+}
+
+Reply MarkdownHeader {
+    margin: 1 0;
+    content-align: left middle;
+}
+
+/* The empty lines around a reply come from the blocks beside it, so its first block leaves none above
+   itself and its last block none below. Each rule gives the whole margin, because in Textual a rule that
+   sets one side resets the other three. The rules name MarkdownBlock, the type of every block of a reply:
+   written for any type (*), a rule about the first or the last child makes Textual apply the styles again
+   to the whole conversation each time a widget is added to it. */
+
+Reply > MarkdownBlock:first-child {
+    margin: 0 0 1 0;
+}
+
+Reply > MarkdownBlock:last-child {
+    margin: 0;
+}
+
+Notice {
+    margin: 1 0 0 2;
+}
+
+Notice.muted {
+    color: $text-muted;
+}
+
+Notice.warning {
+    color: $warning;
+}
+
+Notice.error {
+    color: $error;
+}
+
 /* The message box. */
 
 Input {
@@ -63,6 +144,12 @@ Input {
 Input:focus {
     border: round $primary;
     background-tint: $foreground 0%;
+}
+
+/* A locked message box says what the session is doing, so that text is as readable as a label. */
+
+Input:disabled > .input--placeholder {
+    color: $text-muted;
 }
 
 /* The status line. */
@@ -92,4 +179,15 @@ StatusLine {
     width: 1fr;
     text-align: right;
     color: $text-muted;
+}
+
+/* A narrow terminal has no room for both on one row: the keys go under the context. */
+
+.-narrow StatusLine {
+    layout: vertical;
+    height: 2;
+}
+
+.-narrow #status-keys {
+    width: 100%;
 }

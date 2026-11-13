@@ -7,11 +7,17 @@ from typing import Any
 
 import pytest
 
-from agent_cli.inference.generation import LocalModel
+from agent_cli.inference.generation import LocalModel, token_text
 from agent_cli.inference.loader import load_model, open_without_touching_the_terminal
 from agent_cli.inference.model import ContextFullError
 
 STORY_START = [{"role": "user", "content": "Once upon a time"}]
+TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES = "{% for message in messages %}{{ message['content'] }}{% endfor %}"
+# Like the templates of the models that think: it opens the thinking only when told to let the model think.
+TEMPLATE_WITH_A_THINKING_SWITCH = (
+    TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES
+    + "{% if enable_thinking is defined and enable_thinking is true %}<think>\n{% endif %}"
+)
 PIECES_TO_READ = 5
 TOKENS_LEFT_FREE = 64
 
@@ -20,6 +26,43 @@ TOKENS_LEFT_FREE = 64
 def local_model(small_model_file: Path) -> LocalModel:
     """Return the small model, loaded once for every test of this file."""
     return LocalModel(load_model(small_model_file))
+
+
+def model_with_template(small_model_file: Path, template: str) -> LocalModel:
+    """Return the small model as if its .gguf stored the given chat template."""
+    llama = load_model(small_model_file)
+    llama.metadata["tokenizer.chat_template"] = template
+    return LocalModel(llama)
+
+
+def test_template_is_told_to_let_the_model_think(small_model_file: Path) -> None:
+    """A template that opens the thinking only when told to opens it, and the reply starts with the opening tag."""
+    model = model_with_template(small_model_file, TEMPLATE_WITH_A_THINKING_SWITCH)
+    first_pieces = list(islice(model.reply(STORY_START), 2))
+    model.stop()
+    assert first_pieces[0] == "<think>\n"
+    assert first_pieces[1] != ""
+
+
+def test_reply_gets_no_opening_tag_when_the_template_opens_no_thinking(small_model_file: Path) -> None:
+    """With a template that has no thinking, the reply is only what the model writes."""
+    model = model_with_template(small_model_file, TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES)
+    first_piece = next(model.reply(STORY_START))
+    model.stop()
+    assert "<think>" not in first_piece
+
+
+def test_template_gets_the_texts_of_the_start_and_end_tokens(small_model_file: Path) -> None:
+    """The template is formatted with the model's own start and end tokens, and a token the model lacks has no text."""
+    model = model_with_template(small_model_file, TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES)
+    assert (model.formatter.bos_token, model.formatter.eos_token) == ("<s>", "</s>")
+    assert token_text(model.llama, -1) == ""
+
+
+def test_model_with_no_template_keeps_the_format_of_the_library(local_model: LocalModel) -> None:
+    """A .gguf that stores no chat template is formatted by the library, as before."""
+    assert local_model.formatter is None
+    assert local_model.llama.chat_handler is None
 
 
 def chunk_with(delta: dict[str, str], finish_reason: str | None = None) -> dict[str, Any]:

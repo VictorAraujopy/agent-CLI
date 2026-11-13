@@ -3,6 +3,11 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 
+# How a reply marks what the model thought before it answered: the reply starts with the thinking, between
+# these two tags, and the answer comes after them. Models of several families write their thinking this way.
+THINKING_OPENS = "<think>"
+THINKING_CLOSES = "</think>"
+
 
 class ContextFullError(Exception):
     """The conversation sent to a model takes more tokens than the model's context holds."""
@@ -13,7 +18,7 @@ class Model(ABC):
 
     @abstractmethod
     def reply(self, messages: list[dict[str, str]]) -> Iterator[str]:
-        """Yield the reply one piece of text at a time, raising ContextFullError before any piece if it does not fit."""
+        """Yield the reply, thinking first, piece by piece; ContextFullError before any piece if it does not fit."""
 
     @abstractmethod
     def stop(self) -> None:

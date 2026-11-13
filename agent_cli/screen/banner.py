@@ -14,8 +14,10 @@ from agent_cli.screen.theme import MUTED_MARKUP
 APP_NAME = "agent-CLI"
 TAGLINE = "terminal agent for GGUF or API models"
 MODEL_LABEL = "model"
+CONTEXT_LABEL = "context"
 DIRECTORY_LABEL = "directory"
 NO_MODEL_TEXT = "none loaded"
+NO_CONTEXT_TEXT = "not sized yet"
 LABEL_WIDTH = 10
 
 
@@ -24,6 +26,13 @@ def describe_model(model_name: str | None) -> str:
     if model_name is None:
         return NO_MODEL_TEXT
     return model_name
+
+
+def describe_context(context_tokens: int | None) -> str:
+    """Return the text that tells how many tokens the context of the model in use holds."""
+    if context_tokens is None:
+        return NO_CONTEXT_TEXT
+    return f"{context_tokens} tokens"
 
 
 def shorten_home(directory: Path, home: Path) -> str:
@@ -43,14 +52,17 @@ class Banner(Horizontal):
     """The box with the butterfly on the left and the name and session facts on the right."""
 
     model_name: reactive[str | None] = reactive(None, recompose=True)
+    context_tokens: reactive[int | None] = reactive(None, recompose=True)
 
     def compose(self) -> ComposeResult:
         """Yield the butterfly and the lines of text beside it."""
         model = describe_model(self.model_name)
+        context = describe_context(self.context_tokens)
         directory = shorten_home(Path.cwd(), Path.home())
         yield Butterfly()
         with Vertical(id="banner-text"):
             yield Static(APP_NAME, id="banner-name")
             yield Static(TAGLINE, id="banner-tagline")
             yield Static(info_row(MODEL_LABEL, model), classes="banner-info")
+            yield Static(info_row(CONTEXT_LABEL, context), classes="banner-info")
             yield Static(info_row(DIRECTORY_LABEL, directory), classes="banner-info")

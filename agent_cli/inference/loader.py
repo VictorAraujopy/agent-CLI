@@ -1,4 +1,4 @@
-"""Loading: opens the .gguf file with llama.cpp, alone or split with RPC servers. Local model only."""
+"""Loading: opens the .gguf file with llama.cpp, alone or split with RPC servers, and measures the memory it takes."""
 
 import contextlib
 import ctypes
@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,10 @@ from llama_cpp import Llama
 
 ALL_LAYERS_ON_THE_GPU = -1
 CONTEXT_THE_MODEL_WAS_TRAINED_WITH = 0
+# Context sizes of the measurement, in tokens. Small, so that measuring takes little memory even of a large model.
+PROBE_CONTEXT = 1024
+SMALLER_EXTRA_CONTEXT = 2048
+LARGER_EXTRA_CONTEXT = 4096
 SECONDS_TO_WAIT_FOR_A_SERVER = 5
 SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER = 15
 FOLDER_OF_THIS_PACKAGE = Path(__file__).parent.parent.parent
@@ -22,6 +27,25 @@ REGISTER_A_SERVER_IN_A_NEW_PROCESS = (
     "import sys; sys.path.insert(0, sys.argv[1]); "
     "from agent_cli.inference.loader import register_server; register_server(sys.argv[2])"
 )
+
+
+@dataclass(frozen=True)
+class DeviceMemory:
+    """One device that holds part of the model's context: what it had free and what the model takes, in bytes."""
+
+    name: str
+    free_before_the_model: int
+    model_weights: int
+    any_context: int
+    each_context_token: float
+
+
+@dataclass(frozen=True)
+class MemoryUse:
+    """What a model takes of the memory of each device, and the context it was trained with, in tokens."""
+
+    trained_context: int
+    devices: tuple[DeviceMemory, ...]
 
 
 @llama_cpp.llama_log_callback
@@ -80,6 +104,11 @@ def llama_cpp_library() -> ctypes.CDLL:
     library.ggml_backend_dev_get.argtypes = [ctypes.c_size_t]
     library.ggml_backend_dev_description.restype = ctypes.c_char_p
     library.ggml_backend_dev_description.argtypes = [ctypes.c_void_p]
+    library.ggml_backend_dev_name.restype = ctypes.c_char_p
+    library.ggml_backend_dev_name.argtypes = [ctypes.c_void_p]
+    bytes_free_and_bytes_in_all = [ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_size_t)]
+    library.ggml_backend_dev_memory.restype = None
+    library.ggml_backend_dev_memory.argtypes = [ctypes.c_void_p, *bytes_free_and_bytes_in_all]
     return library
 
 
@@ -145,16 +174,100 @@ def connect_rpc_servers(servers: Sequence[str]) -> None:
         register_server(server)
 
 
-def load_model(model_path: Path, rpc_servers: Sequence[str] = ()) -> Llama:
-    """Open the .gguf file and return the model, with the context it was trained with and ready to generate."""
-    silence_llama_cpp()
-    connect_rpc_servers(rpc_servers)
+def open_model(model_path: Path, rpc_servers: Sequence[str], context_tokens: int) -> Llama:
+    """Create the llama.cpp model with every layer on the devices and a context of the given size."""
     # Mapping the file makes this machine reserve all of it, including the layers that run on the
     # RPC servers. A model that is split is read into memory instead, so each machine holds its part.
     map_the_file_into_memory = not rpc_servers
     return open_without_touching_the_terminal(
         model_path=str(model_path),
         n_gpu_layers=ALL_LAYERS_ON_THE_GPU,
-        n_ctx=CONTEXT_THE_MODEL_WAS_TRAINED_WITH,
+        n_ctx=context_tokens,
         use_mmap=map_the_file_into_memory,
+        # Without flash attention llama.cpp keeps a table of attention scores that grows with the context:
+        # a long context takes far more memory, and no longer the same amount for each token.
+        flash_attn=True,
     )
+
+
+def free_memory_by_device() -> dict[str, int]:
+    """Return how many bytes each device of llama.cpp has free, by the device's name and description."""
+    library = llama_cpp_library()
+    free_by_device = {}
+    for index in range(library.ggml_backend_dev_count()):
+        device = library.ggml_backend_dev_get(index)
+        free_bytes, bytes_in_all = ctypes.c_size_t(), ctypes.c_size_t()
+        library.ggml_backend_dev_memory(device, ctypes.byref(free_bytes), ctypes.byref(bytes_in_all))
+        name = library.ggml_backend_dev_name(device).decode()
+        description = library.ggml_backend_dev_description(device).decode()
+        # A device holding more than it should reports a count that wrapped around: read as signed, it is negative.
+        free_by_device[f"{name} ({description})"] = ctypes.c_int64(free_bytes.value).value
+    return free_by_device
+
+
+def memory_another_context_takes(model: Llama, context_tokens: int) -> dict[str, int]:
+    """Create one more context of the given size on a loaded model, and return the bytes it took of each device."""
+    options = llama_cpp.llama_context_params.from_buffer_copy(model.context_params)
+    options.n_ctx = context_tokens
+    free_before = free_memory_by_device()
+    context = llama_cpp.llama_init_from_model(model.model, options)
+    if not context:
+        raise RuntimeError(f"llama.cpp could not create a context of {context_tokens} tokens to measure the model")
+    free_with_the_context = free_memory_by_device()
+    llama_cpp.llama_free(context)
+    return {device: free_before[device] - free_with_the_context[device] for device in free_before}
+
+
+def device_memory(
+    name: str, free_before_the_model: int, free_with_the_probe: int, smaller_context: int, larger_context: int
+) -> DeviceMemory:
+    """Turn the measurements of one device into what the model's weights, any context and each token take of it."""
+    # Two contexts of different sizes tell apart what each token takes from what a context takes whatever its size.
+    each_context_token = (larger_context - smaller_context) / (LARGER_EXTRA_CONTEXT - SMALLER_EXTRA_CONTEXT)
+    any_context = round(smaller_context - each_context_token * SMALLER_EXTRA_CONTEXT)
+    taken_by_the_probe = free_before_the_model - free_with_the_probe
+    model_weights = round(taken_by_the_probe - any_context - each_context_token * PROBE_CONTEXT)
+    return DeviceMemory(name, free_before_the_model, model_weights, any_context, each_context_token)
+
+
+def measure_memory_use(model_path: Path, rpc_servers: Sequence[str] = ()) -> MemoryUse:
+    """Load the model with a small context and return what it takes of each device that holds part of its context."""
+    silence_llama_cpp()
+    connect_rpc_servers(rpc_servers)
+    free_before_the_model = free_memory_by_device()
+    probe = open_model(model_path, rpc_servers, PROBE_CONTEXT)
+    try:
+        free_with_the_probe = free_memory_by_device()
+        smaller_context = memory_another_context_takes(probe, SMALLER_EXTRA_CONTEXT)
+        larger_context = memory_another_context_takes(probe, LARGER_EXTRA_CONTEXT)
+        trained_context = llama_cpp.llama_model_n_ctx_train(probe.model)
+    finally:
+        probe.close()
+    devices = []
+    for name in free_before_the_model:
+        device = device_memory(
+            name, free_before_the_model[name], free_with_the_probe[name], smaller_context[name], larger_context[name]
+        )
+        # A device the context takes nothing of does not limit it: the processor, when every layer is on a GPU.
+        if device.each_context_token > 0:
+            devices.append(device)
+    return MemoryUse(trained_context, tuple(devices))
+
+
+def confirm_devices_hold(model: Llama) -> None:
+    """Fail, closing the model, when it takes more memory than one of the devices has."""
+    for device, free_bytes in free_memory_by_device().items():
+        if free_bytes < 0:
+            model.close()
+            raise RuntimeError(f"the model takes more memory than {device} has: its context has to be smaller")
+
+
+def load_model(
+    model_path: Path, rpc_servers: Sequence[str] = (), context_tokens: int = CONTEXT_THE_MODEL_WAS_TRAINED_WITH
+) -> Llama:
+    """Open the .gguf file and return the model, ready to generate, with a context of the given size."""
+    silence_llama_cpp()
+    connect_rpc_servers(rpc_servers)
+    model = open_model(model_path, rpc_servers, context_tokens)
+    confirm_devices_hold(model)
+    return model

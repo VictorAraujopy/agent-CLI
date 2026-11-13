@@ -1,2 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-cli"
+version = "0.1.0"
+description = "Terminal agent for GGUF or API models"
+requires-python = ">=3.12"
+# The list of dependencies lives in requirements.txt only, and is read from there.
+dynamic = ["dependencies"]
+
+# The command the installation creates: typing agentcli calls main() of the main.py at the project root.
+[project.scripts]
+agentcli = "main:main"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["agent_cli*"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+# The files that are not Python and that the code reads: the stylesheet of the screen and the default system prompt.
+[tool.setuptools.package-data]
+agent_cli = ["screen/*.tcss", "agent/*.md"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]

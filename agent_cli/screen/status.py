@@ -38,19 +38,30 @@ def gauge(context_used: float) -> str:
     return f"{lit}[{UNLIT_MARKUP}]{unlit}[/]"
 
 
-def context_text(context_used: float) -> str:
-    """Return the label, the gauge and the percentage of the context that is in use."""
+def context_text(context_used: float, tokens_in_context: int) -> str:
+    """Return the label, the gauge, the percentage of the context in use and the tokens the conversation takes."""
     percent = round(context_used * 100)
-    return f"[{MUTED_MARKUP}]{CONTEXT_LABEL}[/]  {gauge(context_used)}  {percent}%"
+    tokens = f"[{MUTED_MARKUP}]{tokens_in_context} tokens[/]"
+    return f"[{MUTED_MARKUP}]{CONTEXT_LABEL}[/]  {gauge(context_used)}  {percent}%  {tokens}"
+
+
+def key_hints(reply_in_progress: bool) -> str:
+    """Return the keys that work now: esc stops a reply, so it only shows while one is being written."""
+    if reply_in_progress:
+        return f"esc stop  {KEY_HINTS}"
+    return KEY_HINTS
 
 
 class StatusLine(Horizontal):
-    """The line under the message box: the context gauge on the left, the keys on the right."""
+    """The line under the message box: the context in use on the left, the keys on the right."""
 
     context_used: reactive[float] = reactive(0.0, recompose=True)
+    tokens_in_context: reactive[int] = reactive(0, recompose=True)
+    reply_in_progress: reactive[bool] = reactive(False, recompose=True)
 
     def compose(self) -> ComposeResult:
-        """Yield the context gauge and the key hints."""
+        """Yield the context gauge with its tokens, and the key hints."""
         level = usage_level(self.context_used)
-        yield Static(context_text(self.context_used), id="status-context", classes=level)
-        yield Static(KEY_HINTS, id="status-keys")
+        context = context_text(self.context_used, self.tokens_in_context)
+        yield Static(context, id="status-context", classes=level)
+        yield Static(key_hints(self.reply_in_progress), id="status-keys")

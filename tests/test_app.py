@@ -13,6 +13,7 @@ from textual.pilot import Pilot
 from textual.widgets import Input, Static
 
 from agent_cli.agent.conversation import Conversation
+from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.generation import LocalModel
 from agent_cli.inference.loader import load_model
 from agent_cli.inference.model import ContextFullError, Model
@@ -103,7 +104,7 @@ class ScriptedModel(Model):
 
 def session_with(model: Model) -> AgentCliApp:
     """Return the screen of a session whose model opens at once."""
-    return AgentCliApp(Conversation(SYSTEM_PROMPT), MODEL_NAME, lambda: model)
+    return AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: lambda: model}))
 
 
 def message_box(app: AgentCliApp) -> Input:
@@ -176,7 +177,7 @@ async def test_message_box_is_locked_while_the_model_loads() -> None:
         model_may_open.wait(SECONDS_TO_WAIT)
         return ScriptedModel(["ok"])
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), MODEL_NAME, open_slowly)
+    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: open_slowly}))
     async with app.run_test() as pilot:
         await pilot.pause()
         assert message_box(app).disabled
@@ -208,7 +209,7 @@ async def test_model_that_fails_to_load_closes_the_screen_with_the_reason(capsys
         """Stand in for a load that fails, as it does when an RPC server is off."""
         raise ConnectionError("the server did not answer")
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), MODEL_NAME, fail_to_open)
+    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: fail_to_open}))
     async with app.run_test() as pilot:
         await wait_until(lambda: app.return_code is not None, pilot)
     assert app.return_code == 1
@@ -225,7 +226,7 @@ async def test_quitting_while_the_model_loads_waits_for_the_load_to_end() -> Non
         model_may_open.wait(SECONDS_TO_WAIT)
         return ScriptedModel(["ok"])
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), MODEL_NAME, open_slowly)
+    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: open_slowly}))
     async with app.run_test() as pilot:
         await pilot.press("ctrl+q")
         await pilot.pause()
@@ -622,7 +623,7 @@ async def test_piece_of_a_reply_is_drawn_without_searching_the_screen(monkeypatc
 
 async def test_session_with_a_real_local_model_shows_its_reply(small_model_file: Path) -> None:
     """The small real model is loaded in the background, replies on the screen and stops when esc is pressed."""
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), MODEL_NAME, lambda: LocalModel(load_model(small_model_file)))
+    app = session_with(LocalModel(load_model(small_model_file)))
     async with app.run_test() as pilot:
         await wait_for_message_box(app, pilot)
         await send("Once upon a time", app, pilot)
@@ -651,3 +652,105 @@ async def test_enter_pressed_twice_sends_the_message_once() -> None:
         await pilot.pause()
         assert [turn.user_text for turn in turns_on_screen(app)] == ["hi"]
     assert len(model.conversations_received) == 1
+
+
+def session_with_models(models: dict[str, Model]) -> AgentCliApp:
+    """Return the screen of a session that can use the models given, by name, starting on the first."""
+    how_to_open = {name: (lambda model=model: model) for name, model in models.items()}
+    return AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog(how_to_open))
+
+
+async def test_command_is_run_by_the_screen_and_never_reaches_the_model() -> None:
+    """Text that starts with a slash is a command: its answer is shown as a notice and no turn starts."""
+    model = ScriptedModel(["ok"])
+    app = session_with(model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("/think off", app, pilot)
+        await wait_until(lambda: notices_on_screen(app) == ["thinking: off"], pilot)
+        assert model.thinking_option == "off"
+        assert turns_on_screen(app) == []
+        assert model.conversations_received == []
+        assert message_box(app).value == ""
+        assert not message_box(app).disabled
+
+
+@pytest.mark.parametrize("text", ["/ think off", "a /think off"])
+async def test_slash_followed_by_a_space_or_in_the_middle_is_a_message(text: str) -> None:
+    """Only a slash at the start, with the command right after it, makes a command: the rest goes to the model."""
+    model = ScriptedModel(["ok"])
+    app = session_with(model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send(text, app, pilot)
+        await wait_until(lambda: len(model.conversations_received) == 1, pilot)
+        assert model.conversations_received[0][-1] == {"role": "user", "content": text}
+        assert model.thinking_option == "on"
+        await wait_for_message_box(app, pilot)
+
+
+async def test_message_box_is_marked_while_a_command_is_typed_and_completes_it() -> None:
+    """While the text is a command the box carries the command style, and it suggests the rest of the command."""
+    app = session_with(ScriptedModel(["ok"]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await pilot.press("/", "t")
+        await wait_until(lambda: message_box(app).has_class("command"), pilot)
+        await wait_until(lambda: message_box(app)._suggestion == "/think", pilot)
+        await pilot.press("backspace", "backspace", "h", "i")
+        await wait_until(lambda: not message_box(app).has_class("command"), pilot)
+
+
+async def test_unknown_command_is_reported_and_not_sent() -> None:
+    """A command that does not exist gets a warning with the ones that do, and the model gets nothing."""
+    model = ScriptedModel(["ok"])
+    app = session_with(model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("/usr/bin", app, pilot)
+        await wait_until(lambda: len(notices_on_screen(app)) == 1, pilot)
+        assert notices_on_screen(app) == ["no such command: /usr/bin   commands: /model, /think"]
+        assert app.query_one(Notice).has_class("warning")
+        assert model.conversations_received == []
+
+
+async def test_model_command_switches_the_model_and_keeps_the_conversation() -> None:
+    """After /model the next message goes to the other model with the earlier turns, and the first one is closed."""
+    first, second = ScriptedModel(["one"]), ScriptedModel(["two"], context_limit=2000)
+    app = session_with_models({"first": first, "second": second})
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("hello", app, pilot)
+        await wait_until(lambda: len(first.conversations_received) == 1, pilot)
+        await wait_for_message_box(app, pilot)
+        await send("/model 2", app, pilot)
+        await wait_until(lambda: app.model is second, pilot)
+        await wait_for_message_box(app, pilot)
+        assert first.was_closed and not second.was_closed
+        assert app.query_one(Banner).model_name == "second"
+        assert app.query_one(Banner).context_tokens == 2000
+        assert notices_on_screen(app) == ["opening second…", "model: second   context: 2000 tokens"]
+        await send("again", app, pilot)
+        await wait_until(lambda: len(second.conversations_received) == 1, pilot)
+        contents = [message["content"] for message in second.conversations_received[0]]
+        assert contents == [SYSTEM_PROMPT, "hello", "one", "again"]
+        await wait_for_message_box(app, pilot)
+
+
+async def test_model_that_fails_to_open_in_a_switch_leaves_the_session_on_the_one_in_use() -> None:
+    """A switch that fails is reported, the model in use stays open and the session goes on."""
+    first = ScriptedModel(["one"])
+
+    def fail_to_open() -> Model:
+        """Stand in for a model that cannot be opened."""
+        raise ConnectionError("the server did not answer")
+
+    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({"first": lambda: first, "second": fail_to_open}))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("/model second", app, pilot)
+        await wait_until(lambda: len(notices_on_screen(app)) == 2, pilot)
+        assert notices_on_screen(app)[1] == "could not open second: the server did not answer"
+        await wait_for_message_box(app, pilot)
+        assert app.model is first and not first.was_closed
+        assert app.return_code is None

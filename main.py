@@ -1,10 +1,14 @@
 """Starts agent-CLI: reads the settings, sizes the model's context to the free memory and opens the screen."""
 
+from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 
 from agent_cli.agent.conversation import Conversation
 from agent_cli.agent.prompt import read_system_prompt
-from agent_cli.config import load_settings
+from agent_cli.config import Settings, load_settings
+from agent_cli.inference.api import open_api_model, open_client
+from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.generation import LocalModel
 from agent_cli.inference.loader import DeviceMemory, MemoryUse, load_model, measure_memory_use
 from agent_cli.inference.model import Model
@@ -44,23 +48,32 @@ def open_local_model(model_path: Path, rpc_servers: tuple[str, ...]) -> Model:
     return LocalModel(llama)
 
 
-def build_app(model_path: Path, rpc_servers: tuple[str, ...], system_prompt_path: Path | None) -> AgentCliApp:
-    """Prepare the screen of a session with the local model: its conversation, its name and how to open it."""
+def models_configured(settings: Settings) -> dict[str, Callable[[], Model]]:
+    """Return, for the name of each model configured, the function that opens it: the local one first."""
+    how_to_open: dict[str, Callable[[], Model]] = {}
+    if settings.model_path is not None:
+        how_to_open[settings.model_path.stem] = partial(open_local_model, settings.model_path, settings.rpc_servers)
+    if settings.api_models and settings.api_key is None:
+        raise SystemExit("agent-CLI: API models are configured without a key. Set AGENT_CLI_API_KEY in the .env file.")
+    if settings.api_models:
+        client = open_client(settings.api_key)
+        for name in settings.api_models:
+            how_to_open[name] = partial(open_api_model, client, name)
+    if not how_to_open:
+        raise SystemExit("agent-CLI: no model configured. Set AGENT_CLI_MODEL_PATH or AGENT_CLI_API_MODELS in .env.")
+    return how_to_open
+
+
+def build_app(how_to_open: dict[str, Callable[[], Model]], system_prompt_path: Path | None) -> AgentCliApp:
+    """Prepare the screen of a session: its conversation and the catalog of the models it can use."""
     system_prompt = read_system_prompt(system_prompt_path)
-    return AgentCliApp(
-        conversation=Conversation(system_prompt),
-        model_name=model_path.stem,
-        # A function, not the model: the screen calls it in the background, so it opens before the model is loaded.
-        open_model=lambda: open_local_model(model_path, rpc_servers),
-    )
+    return AgentCliApp(Conversation(system_prompt), Catalog(how_to_open))
 
 
 def main() -> None:
     """Read the settings, run the session on the screen and end with the exit code the screen closed with."""
     settings = load_settings()
-    if settings.model_path is None:
-        raise SystemExit("agent-CLI: no local model configured. Set AGENT_CLI_MODEL_PATH in the .env file.")
-    app = build_app(settings.model_path, settings.rpc_servers, settings.system_prompt_path)
+    app = build_app(models_configured(settings), settings.system_prompt_path)
     app.run()
     raise SystemExit(app.return_code)
 

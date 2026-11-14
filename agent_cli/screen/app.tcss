@@ -146,6 +146,11 @@ Input:focus {
     background-tint: $foreground 0%;
 }
 
+Input.command {
+    color: $accent;
+    border: round $accent;
+}
+
 /* A locked message box says what the session is doing, so that text is as readable as a label. */
 
 Input:disabled > .input--placeholder {

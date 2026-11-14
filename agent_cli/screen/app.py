@@ -1,6 +1,5 @@
 """The screen: the Textual app that reads what the user types and shows what arrives."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -9,9 +8,12 @@ from textual.app import App, ComposeResult
 from textual.containers import Vertical, VerticalScroll
 from textual.events import Mount, Unmount
 from textual.message import Message
+from textual.suggester import SuggestFromList
 from textual.widgets import Input
 
 from agent_cli.agent.conversation import Conversation, MessageTooLongError
+from agent_cli.commands import completions, is_command, run_command
+from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.model import Model
 from agent_cli.screen.banner import Banner
 from agent_cli.screen.messages import Notice, TurnView
@@ -42,15 +44,17 @@ class AgentCliApp(App):
 
     @dataclass
     class ModelLoaded(Message):
-        """The model was opened and is ready to reply, with a context of this many tokens."""
+        """The model of this name was opened and is ready to reply, with a context of this many tokens."""
 
+        name: str
         model: Model
         context_tokens: int
 
     @dataclass
     class ModelFailedToLoad(Message):
-        """The model could not be opened."""
+        """The model of this name could not be opened."""
 
+        name: str
         reason: str
 
     @dataclass
@@ -82,13 +86,12 @@ class AgentCliApp(App):
         turn: TurnView
         reason: str
 
-    def __init__(self, conversation: Conversation, model_name: str, open_model: Callable[[], Model]) -> None:
-        """Keep the conversation, the name to show for the model and the function that opens the model."""
+    def __init__(self, conversation: Conversation, catalog: Catalog) -> None:
+        """Keep the conversation and the catalog of the models the session can use."""
         super().__init__()
         self.conversation = conversation
-        self.model_name = model_name
-        self.open_model = open_model
-        # None until the background thread opens the model.
+        self.catalog = catalog
+        # None until the background thread opens the first model.
         self.model: Model | None = None
         self.activity = Activity.LOADING_MODEL
         self.close_when_loaded = False
@@ -113,36 +116,56 @@ class AgentCliApp(App):
 
     @on(Mount)
     def start_loading_model(self) -> None:
-        """Lock the message box and start opening the model in the background."""
+        """Lock the message box and start opening the first model of the catalog in the background."""
+        self.open_model(self.catalog.names()[0])
+
+    def open_model(self, name: str) -> None:
+        """Lock the message box and open the named model in the background."""
         self.show_activity(Activity.LOADING_MODEL)
-        self.load_model()
+        self.load_model(name)
 
     @work(thread=True)
-    def load_model(self) -> None:
+    def load_model(self, name: str) -> None:
         """Open the model in a background thread and tell the screen whether it worked."""
         try:
-            model = self.open_model()
+            model = self.catalog.open(name)
         except Exception as error:
-            self.post_message(self.ModelFailedToLoad(str(error)))
+            self.post_message(self.ModelFailedToLoad(name, str(error)))
             return
-        self.post_message(self.ModelLoaded(model, model.context_limit()))
+        self.post_message(self.ModelLoaded(name, model, model.context_limit()))
 
     @on(ModelLoaded)
-    def start_session(self, loaded: ModelLoaded) -> None:
+    async def use_model(self, loaded: ModelLoaded) -> None:
         """Keep the model that was opened, show its name and context and unlock the box, or close if asked."""
+        replaced_a_model = self.model is not None
         self.model = loaded.model
         if self.close_when_loaded:
             self.exit()
             return
         banner = self.query_one(Banner)
-        banner.model_name = self.model_name
+        banner.model_name = loaded.name
         banner.context_tokens = loaded.context_tokens
+        self.query_one(StatusLine).context_used = self.conversation.tokens_in_context / loaded.context_tokens
+        self.query_one(Input).suggester = SuggestFromList(completions(loaded.model, self.catalog))
+        if replaced_a_model:
+            await self.show_notice(f"model: {loaded.name}   context: {loaded.context_tokens} tokens", tone="muted")
         self.show_activity(Activity.WAITING_FOR_MESSAGE)
 
     @on(ModelFailedToLoad)
-    def close_without_model(self, failed: ModelFailedToLoad) -> None:
-        """Close the screen and leave the reason on the terminal: there is no session without a model."""
-        self.exit(return_code=1, message=f"agent-CLI: could not load the model: {failed.reason}")
+    async def report_model_not_opened(self, failed: ModelFailedToLoad) -> None:
+        """Say why the model did not open and stay on the one in use; with none in use, close with the reason."""
+        if self.model is None:
+            self.exit(return_code=1, message=f"agent-CLI: could not load the model: {failed.reason}")
+        elif self.close_when_loaded:
+            self.exit()
+        else:
+            await self.show_notice(f"could not open {failed.name}: {failed.reason}", tone="error")
+            self.show_activity(Activity.WAITING_FOR_MESSAGE)
+
+    @on(Input.Changed)
+    def mark_command(self, changed: Input.Changed) -> None:
+        """Color the message box as a command while what is typed in it is one."""
+        changed.input.set_class(is_command(changed.value), "command")
 
     @on(Input.Submitted)
     async def send_message(self, submitted: Input.Submitted) -> None:
@@ -152,6 +175,9 @@ class AgentCliApp(App):
         if self.model is None or self.activity is not Activity.WAITING_FOR_MESSAGE or not user_text:
             return
         submitted.input.clear()
+        if is_command(user_text):
+            await self.obey_command(user_text, self.model)
+            return
         turn = TurnView(user_text)
         await self.query_one("#conversation-content").mount(turn)
         # Brings the end of the conversation into view and keeps it there while the reply grows, until
@@ -159,6 +185,14 @@ class AgentCliApp(App):
         self.query_one("#conversation").anchor()
         self.show_activity(Activity.GENERATING)
         self.run_turn(self.model, turn, user_text)
+
+    async def obey_command(self, text: str, model: Model) -> None:
+        """Run the command, show what it says and open the model it asks for, if any."""
+        outcome = run_command(text, model, self.catalog)
+        await self.show_notice(outcome.text, tone="warning" if outcome.failed else "muted")
+        self.query_one("#conversation").anchor()
+        if outcome.model_to_open is not None:
+            self.open_model(outcome.model_to_open)
 
     @work(thread=True)
     def run_turn(self, model: Model, turn: TurnView, user_text: str) -> None:
@@ -179,7 +213,7 @@ class AgentCliApp(App):
         """Close the screen, or leave that for when the model is loaded, if it is still loading."""
         # The thread that loads cannot be stopped, and the process only ends after it. Without the screen,
         # what the library writes during the load would land on the terminal.
-        if self.model is None:
+        if self.activity in (Activity.LOADING_MODEL, Activity.CLOSING):
             self.close_when_loaded = True
             self.show_activity(Activity.CLOSING)
             return

@@ -2,7 +2,7 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. The generation through OpenRouter is written and tested, but no session uses it yet: that comes with `/model`. Tools and history are not implemented yet.
+> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. Tools and history are not implemented yet.
 
 ## The idea
 
@@ -78,7 +78,7 @@ Everything is set through environment variables, in a `.env` file that stays out
 | Python with `llama-cpp-python` | Generation runs in C++ inside llama.cpp, so the language is not the bottleneck. Python organizes the conversation and the screen. |
 | Inference code written from scratch | Code written for one specific model carries that model's quirks (conversation format, tool format). Here nothing may depend on which model it is. |
 | A local model gets the largest context its machines hold, never above the one it was trained with | The context is not a setting: nobody should need to know that number to use a model. llama.cpp reserves the memory of the whole context when a model loads, and recent models are trained with contexts that take more memory than most machines have. So when the session opens, the CLI loads the model once with a small context and measures, on this machine's GPU and on each RPC server, how much memory the weights take and how much each token of context takes. From what each device has free it computes the largest context that fits, leaving half a GiB free on each, and loads the model with it. A model that leaves room for fewer than 4096 tokens is refused with an error instead; one trained with less than that only has to fit whole. Two limits come from what llama.cpp reports. A machine with no GPU is not measured, so there the model gets the context it was trained with. And on a Mac the free memory counts only what the CLI itself holds, not what other programs use: a second session opened beside the first sizes its context as if it were alone. An API model gets the size OpenRouter reports for it. |
-| A model that can think is told to think | The chat template of some models has a switch, `enable_thinking`, that lets the model write its thinking before the answer; the CLI formats the conversation with the model's own template and turns that switch on. A template with no such switch ignores it. The thinking arrives at the start of the reply, between `<think>` and `</think>`, the marks models of several families use; they are the only format fixed in the code, and the screen uses them to show the thinking apart from the answer. A small model may never end its thinking: `esc` stops it. With an API model the switch is OpenRouter's: every request asks for the highest reasoning effort the model accepts, the thinking arrives apart from the answer, and the CLI puts it between the same marks. The thinking of earlier replies is never sent back to a provider. |
+| A model that can think is told to think | The chat template of some models has a switch, `enable_thinking`, that lets the model write its thinking before the answer; the CLI formats the conversation with the model's own template and turns that switch on. A template with no such switch ignores it. The thinking arrives at the start of the reply, between `<think>` and `</think>`, the marks models of several families use; they are the only format fixed in the code, and the screen uses them to show the thinking apart from the answer. A small model may never end its thinking: `esc` stops it. With an API model the switch is OpenRouter's: every request asks for the reasoning effort chosen with `/think`, which starts at the highest the model accepts, the thinking arrives apart from the answer, and the CLI puts it between the same marks. The thinking of earlier replies is never sent back to a provider. |
 | Flash attention is always on | Without it llama.cpp keeps a table of attention scores that grows with the context. A long context then takes far more memory, and each token no longer takes a fixed amount, so the context that fits could not be computed from a small measurement. One case is known not to work: llama.cpp does not ask an RPC server what it can compute, so a server whose backend has no flash attention for the size of the model's attention heads stops at the first reply, and the session stops with it. |
 | A single variable to split across two machines | If there is an address, it splits; if it is empty, it does not. A second on/off variable would store the same information twice and allow combinations that make no sense. |
 | API models as an opt-in | They allow comparing a local model with a hosted one in the same CLI, with the same conversation and the same tools. There is no variable to choose between the two: the CLI offers whatever is configured. When both are, the session starts on the local model, because with an API the conversation leaves the machine. |
@@ -97,7 +97,7 @@ A local model has to be loaded into memory, and it leaves memory when the CLI cl
 
 Opening a session loads the model twice: first with a small context, to measure the memory it takes, then with the context that fits. On one machine the second load reuses what the system has just read from disk. Split across two machines it adds a few seconds.
 
-With an API model, what the model thinks is billed as output, and every request asks for as much thinking as the model accepts.
+With an API model, what the model thinks is billed as output, and a model starts with as much thinking as it accepts until `/think` chooses less.
 
 ## Running on two machines
 
@@ -144,6 +144,15 @@ The screen opens at once and the model loads in the background; the message box 
 | `enter` | Sends the message. |
 | `esc` | Stops the reply being written. What was written stays in the conversation. |
 | `ctrl+q` | Quits. During the load of the model, the session closes as soon as the load ends. |
+
+A message that starts with a slash, with the command right after it, is a command: the session runs it and the model never receives it. While you type one the message box changes color and suggests the rest (`→` accepts). A slash followed by a space, or anywhere else in the message, is ordinary text.
+
+| Command | What it does |
+|---|---|
+| `/model` | Lists the configured models, numbered, and marks the one in use. |
+| `/model <number or name>` | Switches to that model. The conversation continues with it, and a local model that is replaced leaves memory. |
+| `/think` | Tells how much the model in use thinks and the choices it has. |
+| `/think <choice>` | Chooses it: `on` or `off` for a local model, an effort from `none` to `max` for a model on OpenRouter. Each model keeps its choice during the session. |
 
 What the model thinks before it answers is shown above the reply, in a muted color. The status line shows how much of the model's context the conversation takes, as a share and in tokens.
 

@@ -3,7 +3,7 @@
 import pytest
 
 from agent_cli.inference.catalog import Catalog
-from test_app import ScriptedModel
+from scripted_model import ScriptedModel
 
 
 def test_names_come_in_the_order_the_models_were_configured() -> None:
@@ -43,7 +43,18 @@ def test_model_that_fails_to_open_leaves_the_one_in_use_open() -> None:
 def test_thinking_chosen_for_a_model_is_given_back_when_it_is_opened_again() -> None:
     """Each model keeps its own choice during the session; one never chosen for starts as the model starts."""
     catalog = Catalog({"first": lambda: ScriptedModel([]), "second": lambda: ScriptedModel([])})
-    catalog.open("first")
-    catalog.remember_thinking("off")
+    first = catalog.open("first")
+    catalog.set_thinking("off")
+    assert first.thinking() == "off"
     assert catalog.open("second").thinking() == "on"
     assert catalog.open("first").thinking() == "off"
+
+
+def test_asking_for_the_model_in_use_before_any_was_opened_is_an_error() -> None:
+    """The catalog has no model in use until the first one is opened, and then hands it over."""
+    model = ScriptedModel([])
+    catalog = Catalog({"first": lambda: model})
+    with pytest.raises(RuntimeError, match="no model was opened yet"):
+        catalog.in_use()
+    catalog.open("first")
+    assert catalog.in_use() is model

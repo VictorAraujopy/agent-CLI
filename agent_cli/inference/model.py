@@ -11,6 +11,23 @@ class ContextFullError(Exception):
     """The conversation sent to a model takes more tokens than the model's context holds."""
 
 
+def thinking_and_answer(reply: str) -> tuple[str, str]:
+    """Split a reply into what the model thought, between the tags that start it, and what it answered."""
+    start = reply.lstrip()
+    if not start.startswith(THINKING_OPENS):
+        return "", reply
+    thinking, _, answer = start.removeprefix(THINKING_OPENS).partition(THINKING_CLOSES)
+    return thinking.strip(), answer.lstrip()
+
+
+def without_its_thinking(message: dict[str, str]) -> dict[str, str]:
+    """Return the message as a model reads it back: a reply of a model, without what the model thought."""
+    if message["role"] != "assistant":
+        return message
+    _, answer = thinking_and_answer(message["content"])
+    return {**message, "content": answer}
+
+
 class Model(ABC):
     """A model the conversation talks to, without knowing whether it runs here or through an API."""
 

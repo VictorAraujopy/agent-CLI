@@ -89,6 +89,27 @@ def test_closing_a_local_model_frees_the_model_of_the_library(
     assert closings == ["closed"]
 
 
+def test_thinking_of_earlier_replies_is_not_given_back_to_the_local_model(
+    local_model: LocalModel, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The conversation the library formats has the earlier replies without what the model thought."""
+    conversations_formatted: list[list[dict[str, str]]] = []
+
+    def note_the_conversation(messages: list[dict[str, str]], stream: bool) -> Iterator[Any]:
+        """Stand in for the library: record the conversation it was given and write no reply."""
+        conversations_formatted.append(messages)
+        return iter([])
+
+    monkeypatch.setattr(local_model.llama, "create_chat_completion", note_the_conversation)
+    conversation = [
+        {"role": "user", "content": "Say hello."},
+        {"role": "assistant", "content": "<think>\nA greeting.\n</think>\n\nHello."},
+        {"role": "user", "content": "Again."},
+    ]
+    list(local_model.reply(conversation))
+    assert conversations_formatted == [[conversation[0], {"role": "assistant", "content": "Hello."}, conversation[2]]]
+
+
 def test_template_gets_the_texts_of_the_start_and_end_tokens(small_model_file: Path) -> None:
     """The template is formatted with the model's own start and end tokens, and a token the model lacks has no text."""
     model = model_with_template(small_model_file, TEMPLATE_THAT_ONLY_JOINS_THE_MESSAGES)

@@ -12,7 +12,7 @@ from llama_cpp.llama_chat_format import (
     chat_formatter_to_chat_completion_handler,
 )
 
-from agent_cli.inference.model import THINKING_OPENS, ContextFullError, Model
+from agent_cli.inference.model import THINKING_OPENS, ContextFullError, Model, without_its_thinking
 
 
 def says_context_is_full(error: ValueError) -> bool:
@@ -91,8 +91,9 @@ class LocalModel(Model):
         """Yield the reply to the conversation one piece of text at a time, as the model writes it."""
         self.finish_reason = None
         self.stop_requested.clear()
+        conversation = [without_its_thinking(message) for message in messages]
         # Without max_tokens the reply ends when the model stops or the context is full.
-        response = self.llama.create_chat_completion(messages, stream=True)
+        response = self.llama.create_chat_completion(conversation, stream=True)
         # The library declares one return type for both modes; with stream=True it is always the chunks.
         stream = cast(Iterator[CreateChatCompletionStreamResponse], response)
         try:

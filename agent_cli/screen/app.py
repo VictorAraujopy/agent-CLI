@@ -47,7 +47,6 @@ class AgentCliApp(App):
         """The model of this name was opened and is ready to reply, with a context of this many tokens."""
 
         name: str
-        model: Model
         context_tokens: int
 
     @dataclass
@@ -70,7 +69,6 @@ class AgentCliApp(App):
 
         turn: TurnView
         was_cut: bool
-        tokens_in_context: int
         context_limit: int
 
     @dataclass
@@ -91,8 +89,6 @@ class AgentCliApp(App):
         super().__init__()
         self.conversation = conversation
         self.catalog = catalog
-        # None until the background thread opens the first model.
-        self.model: Model | None = None
         self.activity = Activity.LOADING_MODEL
         self.close_when_loaded = False
 
@@ -117,36 +113,35 @@ class AgentCliApp(App):
     @on(Mount)
     def start_loading_model(self) -> None:
         """Lock the message box and start opening the first model of the catalog in the background."""
-        self.open_model(self.catalog.names()[0])
+        self.open_in_background(self.catalog.names()[0])
 
-    def open_model(self, name: str) -> None:
-        """Lock the message box and open the named model in the background."""
+    def open_in_background(self, name: str) -> None:
+        """Lock the message box and start opening the named model in a background thread."""
         self.show_activity(Activity.LOADING_MODEL)
-        self.load_model(name)
+        self.open_and_report(name)
 
     @work(thread=True)
-    def load_model(self, name: str) -> None:
-        """Open the model in a background thread and tell the screen whether it worked."""
+    def open_and_report(self, name: str) -> None:
+        """Open the model, which becomes the one in use, and tell the screen whether it worked."""
         try:
             model = self.catalog.open(name)
         except Exception as error:
             self.post_message(self.ModelFailedToLoad(name, str(error)))
             return
-        self.post_message(self.ModelLoaded(name, model, model.context_limit()))
+        self.post_message(self.ModelLoaded(name, model.context_limit()))
 
     @on(ModelLoaded)
     async def use_model(self, loaded: ModelLoaded) -> None:
-        """Keep the model that was opened, show its name and context and unlock the box, or close if asked."""
-        replaced_a_model = self.model is not None
-        self.model = loaded.model
+        """Show the name and the context of the model that was opened and unlock the box, or close if asked."""
         if self.close_when_loaded:
             self.exit()
             return
         banner = self.query_one(Banner)
+        replaced_a_model = banner.model_name is not None
         banner.model_name = loaded.name
         banner.context_tokens = loaded.context_tokens
-        self.query_one(StatusLine).context_used = self.conversation.tokens_in_context / loaded.context_tokens
-        self.query_one(Input).suggester = SuggestFromList(completions(loaded.model, self.catalog))
+        self.show_context_in_use(loaded.context_tokens)
+        self.query_one(Input).suggester = SuggestFromList(completions(self.catalog))
         if replaced_a_model:
             await self.show_notice(f"model: {loaded.name}   context: {loaded.context_tokens} tokens", tone="muted")
         self.show_activity(Activity.WAITING_FOR_MESSAGE)
@@ -154,7 +149,7 @@ class AgentCliApp(App):
     @on(ModelFailedToLoad)
     async def report_model_not_opened(self, failed: ModelFailedToLoad) -> None:
         """Say why the model did not open and stay on the one in use; with none in use, close with the reason."""
-        if self.model is None:
+        if self.catalog.model_in_use is None:
             self.exit(return_code=1, message=f"agent-CLI: could not load the model: {failed.reason}")
         elif self.close_when_loaded:
             self.exit()
@@ -172,11 +167,11 @@ class AgentCliApp(App):
         """Show the message the user typed and start the turn that replies to it."""
         user_text = submitted.value.strip()
         # Only while the session waits for a message: a second enter can arrive before the box is locked.
-        if self.model is None or self.activity is not Activity.WAITING_FOR_MESSAGE or not user_text:
+        if self.activity is not Activity.WAITING_FOR_MESSAGE or not user_text:
             return
         submitted.input.clear()
         if is_command(user_text):
-            await self.obey_command(user_text, self.model)
+            await self.obey_command(user_text)
             return
         turn = TurnView(user_text)
         await self.query_one("#conversation-content").mount(turn)
@@ -184,15 +179,15 @@ class AgentCliApp(App):
         # the user scrolls up.
         self.query_one("#conversation").anchor()
         self.show_activity(Activity.GENERATING)
-        self.run_turn(self.model, turn, user_text)
+        self.run_turn(self.catalog.in_use(), turn, user_text)
 
-    async def obey_command(self, text: str, model: Model) -> None:
+    async def obey_command(self, text: str) -> None:
         """Run the command, show what it says and open the model it asks for, if any."""
-        outcome = run_command(text, model, self.catalog)
+        outcome = run_command(text, self.catalog)
         await self.show_notice(outcome.text, tone="warning" if outcome.failed else "muted")
         self.query_one("#conversation").anchor()
         if outcome.model_to_open is not None:
-            self.open_model(outcome.model_to_open)
+            self.open_in_background(outcome.model_to_open)
 
     @work(thread=True)
     def run_turn(self, model: Model, turn: TurnView, user_text: str) -> None:
@@ -205,9 +200,7 @@ class AgentCliApp(App):
         except Exception as error:
             self.post_message(self.ReplyFailed(turn, str(error)))
         else:
-            tokens_in_context = self.conversation.tokens_in_context
-            was_cut = model.reply_was_cut()
-            self.post_message(self.ReplyEnded(turn, was_cut, tokens_in_context, model.context_limit()))
+            self.post_message(self.ReplyEnded(turn, model.reply_was_cut(), model.context_limit()))
 
     async def action_quit(self) -> None:
         """Close the screen, or leave that for when the model is loaded, if it is still loading."""
@@ -221,8 +214,9 @@ class AgentCliApp(App):
 
     def action_stop_reply(self) -> None:
         """Ask the model to end the reply it is writing; the turn then ends as usual, with what was written."""
-        if self.model is not None:
-            self.model.stop()
+        model_in_use = self.catalog.model_in_use
+        if model_in_use is not None:
+            model_in_use.stop()
 
     @on(Unmount)
     def stop_reply_when_closing(self) -> None:
@@ -240,9 +234,7 @@ class AgentCliApp(App):
         await ended.turn.finish()
         if ended.was_cut:
             await self.show_notice("reply cut: the model's context is full", tone="muted")
-        status = self.query_one(StatusLine)
-        status.tokens_in_context = ended.tokens_in_context
-        status.context_used = ended.tokens_in_context / ended.context_limit
+        self.show_context_in_use(ended.context_limit)
         self.show_activity(Activity.WAITING_FOR_MESSAGE)
 
     @on(MessageTooLong)
@@ -270,6 +262,12 @@ class AgentCliApp(App):
     async def show_notice(self, text: str, tone: str) -> None:
         """Add a line of the screen's own to the end of the conversation."""
         await self.query_one("#conversation-content").mount(Notice(text, tone))
+
+    def show_context_in_use(self, context_limit: int) -> None:
+        """Show on the status line how much of the model's context the conversation takes."""
+        status = self.query_one(StatusLine)
+        status.tokens_in_context = self.conversation.tokens_in_context
+        status.context_used = self.conversation.tokens_in_context / context_limit
 
     def show_activity(self, activity: Activity) -> None:
         """Keep what the session is doing and show it: in the message box, locked unless a message is awaited."""

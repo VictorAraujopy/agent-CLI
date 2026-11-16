@@ -1,4 +1,4 @@
-"""Starts agent-CLI: reads the settings, sizes the model's context to the free memory and opens the screen."""
+"""Starts agent-CLI: reads the settings, prepares how each configured model is opened and opens the screen."""
 
 from collections.abc import Callable
 from functools import partial

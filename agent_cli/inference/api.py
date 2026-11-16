@@ -7,7 +7,13 @@ from typing import Any
 
 import httpx
 
-from agent_cli.inference.model import THINKING_CLOSES, THINKING_OPENS, ContextFullError, Model
+from agent_cli.inference.model import (
+    THINKING_CLOSES,
+    THINKING_OPENS,
+    ContextFullError,
+    Model,
+    without_its_thinking,
+)
 
 
 def open_client(api_key: str) -> httpx.Client:
@@ -110,21 +116,6 @@ def chunks_with_no_error(chunks: Iterable[dict[str, Any]]) -> Iterator[dict[str,
         if error is not None:
             raise failure_reported(error)
         yield chunk
-
-
-def answer_of(reply: str) -> str:
-    """Return a reply without the thinking that starts it; one stopped inside the thinking has no answer."""
-    if not reply.startswith(THINKING_OPENS):
-        return reply
-    _, _, answer = reply.partition(THINKING_CLOSES)
-    return answer.lstrip()
-
-
-def without_its_thinking(message: dict[str, str]) -> dict[str, str]:
-    """Return the message as a provider expects it back: a reply of a model, without what the model thought."""
-    if message["role"] != "assistant":
-        return message
-    return {**message, "content": answer_of(message["content"])}
 
 
 class ApiModel(Model):

@@ -6,7 +6,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import Markdown, Static
 from textual.widgets.markdown import MarkdownStream
 
-from agent_cli.inference.model import THINKING_CLOSES, THINKING_OPENS
+from agent_cli.inference.model import THINKING_CLOSES, THINKING_OPENS, thinking_and_answer
 
 
 class UserMessage(Horizontal):
@@ -62,16 +62,14 @@ def without_a_tag_half_written(text: str, tag: str) -> str:
     return text
 
 
-def thinking_and_answer(written: str) -> tuple[str, str]:
-    """Split what the model wrote so far into what it thought and what it answered."""
-    start = written.lstrip()
-    if not start.startswith(THINKING_OPENS):
-        # While the first letters can still become the opening tag, they are neither thinking nor answer yet.
-        return ("", "") if THINKING_OPENS.startswith(start) else ("", written)
-    thinking, closing, answer = start.removeprefix(THINKING_OPENS).partition(THINKING_CLOSES)
-    if not closing:
-        thinking = without_a_tag_half_written(thinking, THINKING_CLOSES)
-    return thinking.strip(), answer.lstrip()
+def thinking_and_answer_so_far(written: str) -> tuple[str, str]:
+    """Split what the model wrote so far into thinking and answer, leaving out a tag still being written."""
+    if THINKING_OPENS.startswith(written.lstrip()):
+        return "", ""
+    thinking, answer = thinking_and_answer(written)
+    if THINKING_CLOSES not in written:
+        thinking = without_a_tag_half_written(thinking, THINKING_CLOSES).rstrip()
+    return thinking, answer
 
 
 class Thinking(Static):
@@ -118,9 +116,9 @@ class TurnView(Vertical):
 
     async def add_piece(self, piece: str) -> None:
         """Add one piece of what the model writes: to the thinking, or to the reply once the thinking is over."""
-        answer_before = thinking_and_answer(self.written)[1]
+        answer_before = thinking_and_answer_so_far(self.written)[1]
         self.written += piece
-        thinking, answer = thinking_and_answer(self.written)
+        thinking, answer = thinking_and_answer_so_far(self.written)
         self.thinking.show(thinking)
         await self.reply.add_piece(answer[len(answer_before) :])
 

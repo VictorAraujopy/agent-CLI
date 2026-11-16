@@ -9,7 +9,6 @@ import pytest
 
 from agent_cli.inference.api import (
     ApiModel,
-    answer_of,
     chunks_in,
     context_tokens_of,
     endpoints_that_keep_no_data,
@@ -265,20 +264,6 @@ def test_thinking_of_earlier_replies_is_not_sent_back() -> None:
         {"role": "assistant", "content": "Hello."},
         conversation[3],
     ]
-
-
-@pytest.mark.parametrize(
-    ("reply", "answer"),
-    [
-        ("Hello.", "Hello."),
-        ("<think>\nA greeting.\n</think>\n\nHello.", "Hello."),
-        ("<think>\nstopped while thinking", ""),
-        ("The <think> tag opens it and </think> closes it.", "The <think> tag opens it and </think> closes it."),
-    ],
-)
-def test_answer_of_a_reply_is_what_comes_after_the_thinking_that_starts_it(reply: str, answer: str) -> None:
-    """A reply with no thinking is all answer, one stopped inside the thinking has none, and tags later on are text."""
-    assert answer_of(reply) == answer
 
 
 def test_refusal_carries_what_openrouter_explained() -> None:

@@ -1,9 +1,9 @@
 """The commands of a session: what the user types starting with a slash, and what each one does."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from agent_cli.inference.catalog import Catalog
-from agent_cli.inference.model import Model
 
 
 @dataclass(frozen=True)
@@ -15,17 +15,17 @@ class Outcome:
     model_to_open: str | None = None
 
 
+@dataclass(frozen=True)
+class Command:
+    """One command: what runs it with what was typed after its name, and the choices it takes now."""
+
+    run: Callable[[str, Catalog], Outcome]
+    choices: Callable[[Catalog], list[str]]
+
+
 def is_command(text: str) -> bool:
     """Tell whether what the user typed is a command: it starts with a slash that has no space after it."""
     return text.startswith("/") and not text.startswith("/ ")
-
-
-def completions(model: Model, catalog: Catalog) -> list[str]:
-    """Return every command the user can type now, with each choice it takes."""
-    numbers = [str(number) for number in range(1, len(catalog.names()) + 1)]
-    models = [f"/model {choice}" for choice in numbers + catalog.names()]
-    thinking = [f"/think {option}" for option in model.thinking_options()]
-    return ["/model", "/think", *models, *thinking]
 
 
 def list_of_models(catalog: Catalog) -> str:
@@ -46,6 +46,12 @@ def name_chosen(choice: str, names: list[str]) -> str | None:
     return None
 
 
+def model_choices(catalog: Catalog) -> list[str]:
+    """Return what /model takes: the number of each model in the list, and its name."""
+    numbers = [str(number) for number in range(1, len(catalog.names()) + 1)]
+    return numbers + catalog.names()
+
+
 def choose_model(choice: str, catalog: Catalog) -> Outcome:
     """Ask the screen to open the model chosen, or list the models when none is given."""
     if not choice:
@@ -58,23 +64,41 @@ def choose_model(choice: str, catalog: Catalog) -> Outcome:
     return Outcome(f"opening {name}…", model_to_open=name)
 
 
-def choose_thinking(option: str, model: Model, catalog: Catalog) -> Outcome:
+def thinking_choices(catalog: Catalog) -> list[str]:
+    """Return what /think takes: the thinking options of the model in use."""
+    return list(catalog.in_use().thinking_options())
+
+
+def choose_thinking(option: str, catalog: Catalog) -> Outcome:
     """Choose how much the model in use thinks, or tell the choice in use and the others when none is given."""
+    model = catalog.in_use()
     options = ", ".join(model.thinking_options())
     if not option:
         return Outcome(f"thinking: {model.thinking()}   options: {options}")
     if option not in model.thinking_options():
         return Outcome(f"no such thinking option: {option}   options: {options}", failed=True)
-    model.set_thinking(option)
-    catalog.remember_thinking(option)
+    catalog.set_thinking(option)
     return Outcome(f"thinking: {option}")
 
 
-def run_command(text: str, model: Model, catalog: Catalog) -> Outcome:
+COMMANDS = {
+    "model": Command(run=choose_model, choices=model_choices),
+    "think": Command(run=choose_thinking, choices=thinking_choices),
+}
+
+
+def completions(catalog: Catalog) -> list[str]:
+    """Return every command the user can type now: each one alone, then with each choice it takes."""
+    lines = [f"/{name}" for name in COMMANDS]
+    for name, command in COMMANDS.items():
+        lines += [f"/{name} {choice}" for choice in command.choices(catalog)]
+    return lines
+
+
+def run_command(text: str, catalog: Catalog) -> Outcome:
     """Run the command the user typed and return what the screen has to show and do."""
     name, _, argument = text.removeprefix("/").partition(" ")
-    if name == "model":
-        return choose_model(argument.strip(), catalog)
-    if name == "think":
-        return choose_thinking(argument.strip(), model, catalog)
-    return Outcome(f"no such command: /{name}   commands: /model, /think", failed=True)
+    if name not in COMMANDS:
+        commands = ", ".join(f"/{command_name}" for command_name in COMMANDS)
+        return Outcome(f"no such command: /{name}   commands: {commands}", failed=True)
+    return COMMANDS[name].run(argument.strip(), catalog)

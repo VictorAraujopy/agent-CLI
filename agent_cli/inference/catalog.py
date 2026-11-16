@@ -19,6 +19,12 @@ class Catalog:
         """Return the names of the models available, in the order they were configured."""
         return list(self.how_to_open)
 
+    def in_use(self) -> Model:
+        """Return the model in use; asking before the first one was opened is an error."""
+        if self.model_in_use is None:
+            raise RuntimeError("no model was opened yet")
+        return self.model_in_use
+
     def open(self, name: str) -> Model:
         """Open the named model and put it in use, closing the one that was; a failure leaves that one in use."""
         model = self.how_to_open[name]()
@@ -30,7 +36,8 @@ class Catalog:
         self.model_in_use = model
         return model
 
-    def remember_thinking(self, option: str) -> None:
-        """Keep the thinking chosen for the model in use, for when that model is opened again."""
+    def set_thinking(self, option: str) -> None:
+        """Choose the thinking of the model in use, and remember it for when that model is opened again."""
+        self.in_use().set_thinking(option)
         if self.name_in_use is not None:
             self.thinking_chosen[self.name_in_use] = option

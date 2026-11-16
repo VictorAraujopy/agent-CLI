@@ -1,387 +1,361 @@
-"""Tests for the model loader."""
+"""Tests for the loading: the llama-server command, its start and stop, and the servers closed sessions left behind."""
 
-import ctypes
 import os
 import socket
+import stat
 import subprocess
-import sys
+import tempfile
 import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 
-import llama_cpp
+import httpx
 import pytest
-from llama_cpp import Llama
 
 from agent_cli.inference import loader
 from agent_cli.inference.loader import (
-    command_that_registers,
-    connect_rpc_servers,
+    confirm_server_speaks_rpc,
+    folder_of_the_servers,
     host_and_port,
+    llama_server_program,
     load_model,
-    register_server,
+    record_of,
+    server_command,
+    stop_server,
+    stop_servers_left_behind,
     wait_for_server,
 )
 
-SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS = 60
-RPC_SERVER_OF_THIS_MACHINE = """
-import ctypes
-import sys
+SECONDS_A_FAKE_SERVER_RUNS = "60"
+# What the real llama-server writes when the file is not a model: the cause first, then the errors it caused.
+LOG_OF_A_LOAD_THAT_FAILED = (
+    'echo "0.00.000.064 I srv  llama_server: initializing ..."\n'
+    "echo \"0.00.054.590 E gguf_init_from_reader: invalid magic characters: 'xB', expected 'GGUF'\"\n"
+    'echo "0.00.054.704 E llama_model_load: error loading model"\n'
+    'echo "0.00.055.790 E srv  llama_server: exiting due to model loading error"\n'
+    "exit 1"
+)
 
-import llama_cpp
 
-library = llama_cpp.llama_cpp._lib
-llama_cpp.llama_backend_init()
-library.ggml_backend_dev_by_type.restype = ctypes.c_void_p
-library.ggml_backend_dev_by_type.argtypes = [ctypes.c_int]
-processor = (ctypes.c_void_p * 1)(library.ggml_backend_dev_by_type(0))
-library.ggml_backend_rpc_start_server.restype = None
-library.ggml_backend_rpc_start_server.argtypes = [
-    ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)
-]
-library.ggml_backend_rpc_start_server(sys.argv[1].encode(), None, 1, 1, processor)
-"""
+@pytest.fixture(autouse=True)
+def folder_of_this_test(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the logs and records of the servers in the test's folder, away from the ones of real sessions."""
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+
+
+def folder_of_the_servers_in(tmp_path: Path) -> Path:
+    """Return the folder where the servers of a test keep their logs and records."""
+    return tmp_path / f"agent-cli-{os.getuid()}"
+
+
+def program_named(folder: Path, name: str, script: str) -> Path:
+    """Write a shell script with that name in the folder, ready to run, and return its path."""
+    program = folder / name
+    program.write_text(f"#!/bin/sh\n{script}\n")
+    program.chmod(program.stat().st_mode | stat.S_IEXEC)
+    return program
+
+
+def fake_llama_server(folder: Path, script: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Put a llama-server that runs the script on the PATH, in place of the real one."""
+    programs = folder / "programs"
+    programs.mkdir()
+    program_named(programs, "llama-server", script)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(programs), "/usr/bin", "/bin"]))
+
+
+def model_file_in(folder: Path) -> Path:
+    """Write an empty .gguf file in the folder, for the fake servers, which never read it."""
+    model_file = folder / "model.gguf"
+    model_file.touch()
+    return model_file
 
 
 @pytest.fixture
-def port_with_nothing_listening() -> int:
-    """Return a port of this machine that was free a moment ago, so a connection to it is refused."""
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
-
-
-def answer_connections(listener: socket.socket, hang_up: bool, kept_open: list[socket.socket]) -> None:
-    """Accept every connection to the listener, closing it at once or keeping it open and silent."""
-    while True:
-        try:
-            connection, _ = listener.accept()
-        except OSError:
-            return
-        if hang_up:
-            connection.close()
-        else:
-            kept_open.append(connection)
-
-
-def port_that_accepts_connections(hang_up: bool) -> Iterator[int]:
-    """Yield a port of this machine that accepts connections but is not an RPC server."""
-    kept_open: list[socket.socket] = []
+def silent_address() -> Iterator[str]:
+    """Listen on a port of this machine that takes connections and never says anything, and return its address."""
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
-        threading.Thread(target=answer_connections, args=(listener, hang_up, kept_open), daemon=True).start()
-        yield listener.getsockname()[1]
-    for connection in kept_open:
-        connection.close()
+        yield f"127.0.0.1:{listener.getsockname()[1]}"
 
 
 @pytest.fixture
-def rpc_support() -> None:
-    """Skip the test when llama-cpp-python was installed without the RPC backend."""
-    if not llama_cpp.llama_supports_rpc():
-        pytest.skip("llama-cpp-python was installed without RPC support")
+def address_that_is_not_rpc() -> Iterator[str]:
+    """Answer every connection to a port of this machine with text that is not RPC, and return its address."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+
+    def answer_with_http() -> None:
+        """Answer each connection with an HTTP refusal, until the listener closes."""
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            with connection:
+                connection.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n" * 4)
+
+    threading.Thread(target=answer_with_http, daemon=True).start()
+    yield f"127.0.0.1:{listener.getsockname()[1]}"
+    listener.close()
 
 
 @pytest.fixture
-def rpc_server_of_this_machine(rpc_support: None, port_with_nothing_listening: int) -> Iterator[str]:
-    """Start a real RPC server of llama.cpp on this machine, yield its address and stop it afterwards."""
-    address = f"127.0.0.1:{port_with_nothing_listening}"
-    server = subprocess.Popen(
-        [sys.executable, "-c", RPC_SERVER_OF_THIS_MACHINE, address],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    give_up_at = time.monotonic() + SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS
-    while time.monotonic() < give_up_at:
-        try:
-            socket.create_connection(("127.0.0.1", port_with_nothing_listening), timeout=1).close()
-            break
-        except OSError:
-            time.sleep(0.05)
-    yield address
-    server.kill()
-    server.wait()
+def running_llama_server(tmp_path: Path) -> Iterator[subprocess.Popen]:
+    """Run a process named llama-server that only waits, and end it after the test if it is still there."""
+    sleeping_llama_server = tmp_path / "llama-server"
+    sleeping_llama_server.symlink_to("/bin/sleep")
+    process = subprocess.Popen([str(sleeping_llama_server), SECONDS_A_FAKE_SERVER_RUNS])
+    # The parent of a server left behind is gone, and the system collects it as soon as it ends. Here the test is
+    # its parent, so a thread collects it; otherwise it would linger after ending and seem to be still running.
+    threading.Thread(target=process.wait, daemon=True).start()
+    yield process
+    process.kill()
+    process.wait()
 
 
-@pytest.fixture
-def port_that_hangs_up() -> Iterator[int]:
-    """Yield a port that accepts a connection and closes it at once, as a wrong service would."""
-    yield from port_that_accepts_connections(hang_up=True)
+def ended_session_id() -> int:
+    """Return the number of a process that already ended, as the session that started a server left behind."""
+    session = subprocess.Popen(["true"])
+    session.wait()
+    return session.pid
 
 
-@pytest.fixture
-def port_that_stays_silent() -> Iterator[int]:
-    """Yield a port that accepts a connection and never answers, as a busy RPC server would."""
-    yield from port_that_accepts_connections(hang_up=False)
+def test_missing_llama_server_says_what_to_install(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no llama-server on the PATH, the error says to install llama.cpp."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    with pytest.raises(FileNotFoundError, match="install llama.cpp"):
+        llama_server_program()
 
 
-def test_missing_file_is_refused(tmp_path: Path) -> None:
-    """A path with no file raises an error that names the path."""
-    missing_file = tmp_path / "missing.gguf"
-    with pytest.raises(ValueError, match="missing.gguf"):
-        load_model(missing_file)
+def test_command_serves_the_model_alone_with_every_layer_on_the_devices() -> None:
+    """One slot, every layer on the GPU, flash attention, the context fitted to the free memory, no web page."""
+    command = server_command("/bin/llama-server", Path("model.gguf"), (), 8080)
+    assert command == [
+        "/bin/llama-server",
+        "--model", "model.gguf",
+        "--host", "127.0.0.1",
+        "--port", "8080",
+        "--parallel", "1",
+        "--n-gpu-layers", "all",
+        "--flash-attn", "on",
+        "--fit", "on",
+        "--fit-target", "512",
+        "--fit-ctx", "4096",
+        "--batch-size", "512",
+        "--cache-ram", "0",
+        "--log-timestamps",
+        "--log-prefix",
+        "--no-webui",
+    ]
 
 
-def test_file_that_is_not_a_model_is_refused(tmp_path: Path) -> None:
-    """A file that is not a GGUF raises an error instead of returning a broken model."""
+def test_command_of_a_split_model_names_the_rpc_servers_and_reads_the_file_into_memory() -> None:
+    """A split model goes to every RPC server, and the file is read instead of mapped."""
+    command = server_command("/bin/llama-server", Path("model.gguf"), ("10.0.0.2:50052", "10.0.0.3:50052"), 8080)
+    assert command[-4:] == ["--rpc", "10.0.0.2:50052,10.0.0.3:50052", "--load-mode", "none"]
+
+
+def test_rpc_server_address_is_split_into_host_and_port() -> None:
+    """An ip:port address gives its two parts; one with no port is refused, naming the address."""
+    assert host_and_port("10.0.0.2:50052") == ("10.0.0.2", 50052)
+    with pytest.raises(ValueError, match="10.0.0.2"):
+        host_and_port("10.0.0.2")
+
+
+def test_rpc_server_that_does_not_answer_is_named_in_the_error() -> None:
+    """An address where nothing listens fails at once, with the address in the error."""
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    with pytest.raises(ConnectionError, match=f"the RPC server 127.0.0.1:{closed_port} did not answer"):
+        wait_for_server(f"127.0.0.1:{closed_port}")
+
+
+def test_rpc_server_that_takes_the_connection_and_says_nothing_is_named_in_the_error(
+    silent_address: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real llama-server waits forever on such an address: the check gives up, saying the server may be busy."""
+    monkeypatch.setattr(loader, "SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER", 1)
+    with pytest.raises(ConnectionError, match=f"{silent_address} accepted the connection but did not answer"):
+        confirm_server_speaks_rpc(llama_server_program(), silent_address)
+
+
+def test_address_that_answers_something_else_is_not_an_rpc_server(address_that_is_not_rpc: str) -> None:
+    """The real llama-server gives up on an address that answers in another protocol, and the error names it."""
+    with pytest.raises(ConnectionError, match=f"{address_that_is_not_rpc} did not answer as an RPC server"):
+        confirm_server_speaks_rpc(llama_server_program(), address_that_is_not_rpc)
+
+
+def test_rpc_server_that_does_not_answer_stops_the_load_before_the_server_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An address where nothing listens fails the load, and llama-server never runs."""
+    fake_llama_server(tmp_path, f"touch {tmp_path / 'it-ran'}", monkeypatch)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        closed_port = probe.getsockname()[1]
+    with pytest.raises(ConnectionError, match="did not answer"):
+        load_model(model_file_in(tmp_path), (f"127.0.0.1:{closed_port}",))
+    assert not (tmp_path / "it-ran").exists()
+
+
+def test_rpc_server_that_says_nothing_stops_the_load_before_the_server_starts(
+    tmp_path: Path, silent_address: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An RPC server that takes the connection and never answers fails the load, and the model is never served."""
+    # The fake waits like the real one when it lists the devices, and otherwise leaves a mark that it served.
+    script = f'case "$*" in *--list-devices*) exec sleep 30 ;; *) touch {tmp_path / "it-ran"}; exit 1 ;; esac'
+    fake_llama_server(tmp_path, script, monkeypatch)
+    monkeypatch.setattr(loader, "SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER", 1)
+    with pytest.raises(ConnectionError, match="accepted the connection but did not answer"):
+        load_model(model_file_in(tmp_path), (silent_address,))
+    assert not (tmp_path / "it-ran").exists()
+
+
+def test_missing_model_file_is_refused_before_any_server_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A path with no file fails with the path, and the server never runs."""
+    fake_llama_server(tmp_path, f"touch {tmp_path / 'it-ran'}", monkeypatch)
+    with pytest.raises(FileNotFoundError, match="missing.gguf does not exist"):
+        load_model(tmp_path / "missing.gguf")
+    assert not (tmp_path / "it-ran").exists()
+
+
+def test_server_that_ends_while_loading_fails_with_the_first_error_it_wrote(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The error carries the cause, which comes before the errors it caused, and where the whole log is."""
+    fake_llama_server(tmp_path, LOG_OF_A_LOAD_THAT_FAILED, monkeypatch)
+    with pytest.raises(RuntimeError, match="loaded: gguf_init_from_reader: invalid magic characters") as failure:
+        load_model(model_file_in(tmp_path))
+    assert str(folder_of_the_servers_in(tmp_path) / f"session-{os.getpid()}.log") in str(failure.value)
+    assert list(folder_of_the_servers_in(tmp_path).glob("*.session")) == []
+
+
+def test_error_of_an_earlier_load_of_the_session_is_not_the_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The log keeps every load of the session; only the lines of the load that failed now are read."""
+    log_file = folder_of_the_servers() / f"session-{os.getpid()}.log"
+    log_file.write_text("0.00.010.000 E llama_model_load: an error of the model loaded before\n")
+    fake_llama_server(tmp_path, LOG_OF_A_LOAD_THAT_FAILED, monkeypatch)
+    with pytest.raises(RuntimeError, match="invalid magic characters"):
+        load_model(model_file_in(tmp_path))
+
+
+def test_server_that_writes_no_error_fails_with_its_last_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no line at the error level, the last line the server wrote is the reason given."""
+    fake_llama_server(tmp_path, 'echo "loading the model"\necho "out of memory"\nexit 1', monkeypatch)
+    with pytest.raises(RuntimeError, match="ended before the model was loaded: out of memory"):
+        load_model(model_file_in(tmp_path))
+
+
+def test_real_server_given_a_file_that_is_not_a_model_says_why(tmp_path: Path) -> None:
+    """The real llama-server, on a file that is not a model, fails the load with the cause it wrote."""
     not_a_model = tmp_path / "not-a-model.gguf"
-    not_a_model.write_text("this is not a model")
-    with pytest.raises(ValueError, match="not-a-model.gguf"):
+    not_a_model.write_bytes(b"this is not a model" * 200)
+    with pytest.raises(RuntimeError, match="invalid magic characters"):
         load_model(not_a_model)
 
 
-def test_model_is_loaded_with_the_context_it_was_trained_with(small_model_file: Path) -> None:
-    """A real model loads with the context size stored in its .gguf and splits text into tokens."""
-    model = load_model(small_model_file)
-    assert isinstance(model, Llama)
-    assert model.n_ctx() == 2048
-    assert len(model.tokenize(b"hello world")) > 0
+def test_server_gets_its_key_only_through_its_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key is in no argument, and none of this session's variables reach the server, the key of OpenRouter included."""
+    monkeypatch.setenv("AGENT_CLI_API_KEY", "the-key-of-openrouter")
+    received = tmp_path / "received"
+    fake_llama_server(tmp_path, f'echo "$@" > {received}.arguments\n/usr/bin/env > {received}.environment', monkeypatch)
+    with pytest.raises(RuntimeError):
+        load_model(model_file_in(tmp_path))
+    variables = dict(line.split("=", 1) for line in Path(f"{received}.environment").read_text().splitlines())
+    # The shell that runs the fake server adds PWD, SHLVL and _ of its own.
+    assert set(variables) - {"PWD", "SHLVL", "_"} == {"LLAMA_API_KEY"}
+    assert len(variables["LLAMA_API_KEY"]) >= 32
+    assert variables["LLAMA_API_KEY"] not in Path(f"{received}.arguments").read_text()
 
 
-def test_llama_cpp_is_asked_for_the_context_stored_in_the_gguf(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The loader passes n_ctx=0, which tells llama.cpp to take the context size from the .gguf."""
-    options_given_to_llama_cpp = {}
-    monkeypatch.setattr(
-        loader, "open_without_touching_the_terminal", options_given_to_llama_cpp.update
-    )
-    load_model(Path("any.gguf"))
-    assert options_given_to_llama_cpp["n_ctx"] == 0
+def test_server_of_an_ended_session_is_ended(running_llama_server: subprocess.Popen) -> None:
+    """A llama-server whose session ended is ended, and its record goes with it."""
+    record_of(running_llama_server.pid).write_text(str(ended_session_id()))
+    stop_servers_left_behind()
+    assert running_llama_server.wait(timeout=5) is not None
+    assert not record_of(running_llama_server.pid).exists()
 
 
-def test_loading_writes_nothing_on_the_terminal(
-    small_model_file: Path, capfd: pytest.CaptureFixture[str]
+def test_server_of_an_open_session_is_left_running(running_llama_server: subprocess.Popen) -> None:
+    """A llama-server whose session is still open is in use: it keeps running, and so does its record."""
+    record_of(running_llama_server.pid).write_text(str(os.getpid()))
+    stop_servers_left_behind()
+    assert running_llama_server.poll() is None
+    assert record_of(running_llama_server.pid).exists()
+
+
+def test_load_ends_the_servers_of_ended_sessions_before_its_own(
+    running_llama_server: subprocess.Popen, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Loading stays silent, because anything written would land on top of the screen."""
-    load_model(small_model_file)
-    written = capfd.readouterr()
-    assert written.out == ""
-    assert written.err == ""
+    """Loading a model first ends the server a closed session left behind, even when the new load fails."""
+    record_of(running_llama_server.pid).write_text(str(ended_session_id()))
+    fake_llama_server(tmp_path, "exit 1", monkeypatch)
+    with pytest.raises(RuntimeError):
+        load_model(model_file_in(tmp_path))
+    assert running_llama_server.wait(timeout=5) is not None
 
 
-def test_generating_writes_nothing_on_the_terminal(
-    small_model_file: Path, capfd: pytest.CaptureFixture[str]
-) -> None:
-    """After a load the library stays silent, also when it reuses the start of the previous text."""
-    model = load_model(small_model_file)
-    model.create_completion("Once upon a time", max_tokens=4)
-    model.create_completion("Once upon a time", max_tokens=4)
-    written = capfd.readouterr()
-    assert written.out == ""
-    assert written.err == ""
+def test_record_still_being_written_is_left_alone(running_llama_server: subprocess.Popen) -> None:
+    """An empty record, of a session writing it right now, stops neither the cleanup nor its server."""
+    record_of(running_llama_server.pid).touch()
+    stop_servers_left_behind()
+    assert running_llama_server.poll() is None
+    assert record_of(running_llama_server.pid).exists()
 
 
-def test_loading_leaves_the_output_of_the_terminal_in_place(
-    small_model_file: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The terminal's output is never pointed elsewhere during a load, so a screen drawn there keeps working."""
-    output_before = os.fstat(2)
-    output_during_the_load = []
+def test_folder_of_the_servers_is_open_only_to_this_user(tmp_path: Path) -> None:
+    """The folder is named after the user and only the user can open it, even where every user shares /tmp."""
+    folder = folder_of_the_servers()
+    assert folder == folder_of_the_servers_in(tmp_path)
+    assert stat.S_IMODE(folder.stat().st_mode) == 0o700
 
-    @llama_cpp.llama_log_callback
-    def remember_the_output(level: int, text: bytes, user_data: ctypes.c_void_p) -> None:
-        """Record where the terminal's error output points each time llama.cpp says something."""
-        output_during_the_load.append(os.fstat(2))
 
-    def listen_to_llama_cpp() -> None:
-        """Stand in for the silencing, so that the messages of the load reach this test."""
-        llama_cpp.llama_log_set(remember_the_output, ctypes.c_void_p(0))
+def test_folder_other_users_can_write_to_is_refused(tmp_path: Path) -> None:
+    """A folder of that name that another user could write to, as one made by someone else, is not used."""
+    folder_of_the_servers_in(tmp_path).mkdir()
+    folder_of_the_servers_in(tmp_path).chmod(0o777)
+    with pytest.raises(PermissionError, match="only this user can open"):
+        folder_of_the_servers()
 
-    monkeypatch.setattr(loader, "silence_llama_cpp", listen_to_llama_cpp)
+
+def test_link_in_place_of_the_folder_is_refused(tmp_path: Path) -> None:
+    """A link with the name of the folder, which could lead the logs anywhere, is not followed."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    folder_of_the_servers_in(tmp_path).symlink_to(elsewhere)
+    with pytest.raises(PermissionError, match="only this user can open"):
+        folder_of_the_servers()
+
+
+def test_number_that_now_belongs_to_another_program_is_not_ended() -> None:
+    """When the number of a server left behind belongs to another program now, only the record is removed."""
+    other_program = subprocess.Popen(["sleep", SECONDS_A_FAKE_SERVER_RUNS])
+    record_of(other_program.pid).write_text(str(ended_session_id()))
+    stop_servers_left_behind()
+    assert other_program.poll() is None
+    assert not record_of(other_program.pid).exists()
+    other_program.kill()
+    other_program.wait()
+
+
+def test_real_server_answers_only_with_its_key_and_ends_when_stopped(small_model_file: Path) -> None:
+    """The small model is served on this machine to whoever has the key; stopping ends it and removes its record."""
+    server = load_model(small_model_file)
     try:
-        load_model(small_model_file)
+        assert server.address.startswith("http://127.0.0.1:")
+        assert record_of(server.process.pid).read_text() == str(os.getpid())
+        with_the_key = {"Authorization": f"Bearer {server.key}"}
+        assert httpx.get(f"{server.address}/v1/models", headers=with_the_key).status_code == 200
+        assert httpx.get(f"{server.address}/v1/models").status_code == 401
     finally:
-        llama_cpp.llama_log_set(loader.discard_message, ctypes.c_void_p(0))
-    assert output_during_the_load
-    assert all(
-        (output.st_dev, output.st_ino) == (output_before.st_dev, output_before.st_ino)
-        for output in output_during_the_load
-    )
-
-
-@pytest.mark.parametrize(
-    ("rpc_servers", "file_is_mapped"), [((), True), (("10.0.0.2:50052",), False)]
-)
-def test_model_split_with_rpc_servers_is_read_instead_of_mapped(
-    monkeypatch: pytest.MonkeyPatch, rpc_servers: tuple[str, ...], file_is_mapped: bool
-) -> None:
-    """A split model is not mapped, so this machine reserves only the layers that run on it."""
-    options_given_to_llama_cpp = {}
-    monkeypatch.setattr(loader, "connect_rpc_servers", lambda servers: None)
-    monkeypatch.setattr(
-        loader, "open_without_touching_the_terminal", options_given_to_llama_cpp.update
-    )
-    load_model(Path("any.gguf"), rpc_servers)
-    assert options_given_to_llama_cpp["use_mmap"] is file_is_mapped
-
-
-def test_address_is_split_into_host_and_port() -> None:
-    """An ip:port address becomes the host as text and the port as a number."""
-    assert host_and_port("10.0.0.2:50052") == ("10.0.0.2", 50052)
-
-
-@pytest.mark.parametrize("wrong_address", ["10.0.0.2", ":50052", "10.0.0.2:port", ""])
-def test_address_that_is_not_ip_and_port_is_refused(wrong_address: str) -> None:
-    """An address without a host or without a numeric port raises an error that shows the format."""
-    with pytest.raises(ValueError, match="ip:port"):
-        host_and_port(wrong_address)
-
-
-def test_server_that_does_not_answer_is_reported(port_with_nothing_listening: int) -> None:
-    """A server that cannot be reached raises a connection error instead of hanging the load."""
-    with pytest.raises(ConnectionError, match="did not answer"):
-        wait_for_server(f"127.0.0.1:{port_with_nothing_listening}")
-
-
-def test_server_that_stays_silent_is_given_up_on_after_the_wait(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A server that never answers is waited for the set number of seconds and then reported."""
-    waits_asked = []
-
-    def never_connect(address: tuple[str, int], timeout: float) -> None:
-        """Stand in for a connection attempt to a machine that does not answer."""
-        waits_asked.append(timeout)
-        raise TimeoutError("timed out")
-
-    monkeypatch.setattr(loader.socket, "create_connection", never_connect)
-    with pytest.raises(ConnectionError, match="did not answer"):
-        wait_for_server("10.0.0.2:50052")
-    assert waits_asked == [5]
-
-
-def test_separate_process_runs_from_any_folder_and_reaches_llama_cpp(
-    rpc_support: None, tmp_path: Path, port_with_nothing_listening: int
-) -> None:
-    """The process that makes the first contact finds this package and gets llama.cpp's own answer."""
-    finished = subprocess.run(
-        command_that_registers(f"127.0.0.1:{port_with_nothing_listening}"),
-        cwd=tmp_path,
-        capture_output=True,
-        text=True,
-        timeout=SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS,
-    )
-    assert "refused the connection" in finished.stderr
-
-
-def test_separate_process_ignores_modules_of_the_folder_it_runs_in(
-    rpc_support: None, tmp_path: Path, port_with_nothing_listening: int
-) -> None:
-    """A file named like a standard module, left in the current folder, is never run by that process."""
-    (tmp_path / "socket.py").write_text(
-        "from pathlib import Path\nPath(__file__).with_name('was-imported').touch()\n"
-    )
-    subprocess.run(
-        command_that_registers(f"127.0.0.1:{port_with_nothing_listening}"),
-        cwd=tmp_path,
-        capture_output=True,
-        timeout=SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS,
-    )
-    assert not (tmp_path / "was-imported").exists()
-
-
-def test_connected_server_becomes_one_device_of_llama_cpp(rpc_server_of_this_machine: str) -> None:
-    """Connecting a real RPC server makes it a device of llama.cpp, once, however often it is connected."""
-    connect_twice_and_count_the_devices_of_the_server = (
-        "import sys; sys.path.insert(0, sys.argv[1]); "
-        "from agent_cli.inference import loader; loader.silence_llama_cpp(); "
-        "loader.connect_rpc_servers((sys.argv[2],)); loader.connect_rpc_servers((sys.argv[2],)); "
-        "print(loader.device_descriptions().count(sys.argv[2]))"
-    )
-    command = [
-        sys.executable,
-        "-P",
-        "-c",
-        connect_twice_and_count_the_devices_of_the_server,
-        str(Path(__file__).parent.parent),
-        rpc_server_of_this_machine,
-    ]
-    finished = subprocess.run(
-        command, capture_output=True, text=True, timeout=SECONDS_TO_WAIT_FOR_A_HELPER_PROCESS
-    )
-    assert finished.stdout.strip() == "1"
-
-
-def test_no_servers_leaves_everything_on_this_machine(monkeypatch: pytest.MonkeyPatch) -> None:
-    """With no RPC server configured, connecting does nothing, even on a library without RPC support."""
-    monkeypatch.setattr(llama_cpp, "llama_supports_rpc", lambda: False)
-    connect_rpc_servers(())
-
-
-def test_every_server_is_waited_for_confirmed_and_then_registered(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Connecting checks each server and registers it with llama.cpp, in the order they were given."""
-    steps = []
-    monkeypatch.setattr(llama_cpp, "llama_supports_rpc", lambda: True)
-    monkeypatch.setattr(loader, "device_descriptions", lambda: [])
-    monkeypatch.setattr(loader, "wait_for_server", lambda server: steps.append(("wait", server)))
-    monkeypatch.setattr(
-        loader, "confirm_server_speaks_rpc", lambda server: steps.append(("confirm", server))
-    )
-    monkeypatch.setattr(loader, "register_server", lambda server: steps.append(("register", server)))
-    connect_rpc_servers(("10.0.0.2:50052", "10.0.0.3:50052"))
-    assert steps == [
-        ("wait", "10.0.0.2:50052"),
-        ("confirm", "10.0.0.2:50052"),
-        ("register", "10.0.0.2:50052"),
-        ("wait", "10.0.0.3:50052"),
-        ("confirm", "10.0.0.3:50052"),
-        ("register", "10.0.0.3:50052"),
-    ]
-
-
-def test_server_that_is_already_a_device_is_left_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A server registered earlier in this process is not contacted again."""
-    steps = []
-    monkeypatch.setattr(llama_cpp, "llama_supports_rpc", lambda: True)
-    monkeypatch.setattr(loader, "device_descriptions", lambda: ["10.0.0.2:50052"])
-    monkeypatch.setattr(loader, "wait_for_server", lambda server: steps.append(("wait", server)))
-    monkeypatch.setattr(
-        loader, "confirm_server_speaks_rpc", lambda server: steps.append(("confirm", server))
-    )
-    monkeypatch.setattr(loader, "register_server", lambda server: steps.append(("register", server)))
-    connect_rpc_servers(("10.0.0.2:50052",))
-    assert steps == []
-
-
-def test_address_that_is_not_an_rpc_server_is_reported(
-    rpc_support: None, port_that_hangs_up: int
-) -> None:
-    """An open port that is not an RPC server raises an error instead of ending the program."""
-    with pytest.raises(ConnectionError, match="did not answer as an RPC server"):
-        connect_rpc_servers((f"127.0.0.1:{port_that_hangs_up}",))
-
-
-def test_server_that_accepts_and_never_answers_is_given_up_on(
-    rpc_support: None, port_that_stays_silent: int, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A server that takes the connection and says nothing raises an error instead of waiting forever."""
-    monkeypatch.setattr(loader, "SECONDS_TO_WAIT_FOR_AN_RPC_ANSWER", 2)
-    with pytest.raises(ConnectionError, match="accepted the connection but did not answer"):
-        connect_rpc_servers((f"127.0.0.1:{port_that_stays_silent}",))
-
-
-def test_devices_of_llama_cpp_are_described_as_text(rpc_support: None) -> None:
-    """The list that tells whether a server is already a device comes from llama.cpp itself."""
-    descriptions = loader.device_descriptions()
-    assert descriptions
-    assert all(isinstance(description, str) for description in descriptions)
-
-
-def test_registering_a_server_that_is_not_there_is_reported(
-    rpc_support: None, port_with_nothing_listening: int
-) -> None:
-    """Registering reaches llama.cpp for real, and a server it cannot connect to raises an error."""
-    with pytest.raises(ConnectionError, match="refused the connection"):
-        register_server(f"127.0.0.1:{port_with_nothing_listening}")
-
-
-def test_servers_are_refused_when_the_library_has_no_rpc_support(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A library compiled without RPC raises an error that says how to reinstall it."""
-    monkeypatch.setattr(llama_cpp, "llama_supports_rpc", lambda: False)
-    with pytest.raises(RuntimeError, match="GGML_RPC"):
-        connect_rpc_servers(("10.0.0.2:50052",))
+        stop_server(server)
+    assert server.process.poll() is not None
+    assert not record_of(server.process.pid).exists()

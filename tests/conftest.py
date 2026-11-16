@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import inspect
+import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -14,6 +16,14 @@ SMALL_MODEL_URL = (
 )
 SMALL_MODEL_SHA256 = "270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d"
 SMALL_MODEL_FILE = Path(__file__).parent.parent / "storage" / "models" / "stories260K-f32.gguf"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def temporary_folder_of_the_tests(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """Keep the logs and records of the servers the tests start away from the ones of real sessions."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(tempfile, "tempdir", str(tmp_path_factory.mktemp("temporary")))
+        yield
 
 
 @pytest.hookimpl(tryfirst=True)

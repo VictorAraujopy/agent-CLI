@@ -204,8 +204,7 @@ class AgentCliApp(App):
 
     async def action_quit(self) -> None:
         """Close the screen, or leave that for when the model is loaded, if it is still loading."""
-        # The thread that loads cannot be stopped, and the process only ends after it. Without the screen,
-        # what the library writes during the load would land on the terminal.
+        # The thread that loads cannot be stopped, and the process only ends after it.
         if self.activity in (Activity.LOADING_MODEL, Activity.CLOSING):
             self.close_when_loaded = True
             self.show_activity(Activity.CLOSING)

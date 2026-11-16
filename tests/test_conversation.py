@@ -7,8 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent_cli.agent.conversation import Conversation, MessageTooLongError
-from agent_cli.inference.generation import LocalModel
-from agent_cli.inference.loader import load_model
+from agent_cli.inference.generation import LocalModel, open_local_model
 from agent_cli.inference.model import ContextFullError, Model
 
 SYSTEM_PROMPT = "Be brief."
@@ -16,9 +15,11 @@ SYSTEM_MESSAGE = {"role": "system", "content": SYSTEM_PROMPT}
 
 
 @pytest.fixture(scope="module")
-def local_model(small_model_file: Path) -> LocalModel:
-    """Return the small real model, loaded once for the tests that run the conversation on it."""
-    return LocalModel(load_model(small_model_file))
+def local_model(small_model_file: Path) -> Iterator[LocalModel]:
+    """Serve the small real model once for the tests that run the conversation on it, and end its server after them."""
+    model = open_local_model(small_model_file)
+    yield model
+    model.close()
 
 
 class FakeModel(Model):

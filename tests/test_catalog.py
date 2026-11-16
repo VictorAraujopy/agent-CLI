@@ -50,6 +50,17 @@ def test_thinking_chosen_for_a_model_is_given_back_when_it_is_opened_again() -> 
     assert catalog.open("first").thinking() == "off"
 
 
+def test_closing_the_catalog_closes_the_model_in_use_and_leaves_none() -> None:
+    """At the end of the session the model in use is closed; a catalog with none in use closes nothing."""
+    model = ScriptedModel([])
+    catalog = Catalog({"first": lambda: model})
+    catalog.close()
+    catalog.open("first")
+    catalog.close()
+    assert model.was_closed
+    assert (catalog.name_in_use, catalog.model_in_use) == (None, None)
+
+
 def test_asking_for_the_model_in_use_before_any_was_opened_is_an_error() -> None:
     """The catalog has no model in use until the first one is opened, and then hands it over."""
     model = ScriptedModel([])

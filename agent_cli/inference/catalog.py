@@ -36,6 +36,13 @@ class Catalog:
         self.model_in_use = model
         return model
 
+    def close(self) -> None:
+        """Close the model in use, if one was opened, leaving the session with none."""
+        if self.model_in_use is not None:
+            self.model_in_use.close()
+        self.name_in_use = None
+        self.model_in_use = None
+
     def set_thinking(self, option: str) -> None:
         """Choose the thinking of the model in use, and remember it for when that model is opened again."""
         self.in_use().set_thinking(option)

@@ -14,8 +14,7 @@ from textual.widgets import Input, Static
 
 from agent_cli.agent.conversation import Conversation
 from agent_cli.inference.catalog import Catalog
-from agent_cli.inference.generation import LocalModel
-from agent_cli.inference.loader import load_model
+from agent_cli.inference.generation import open_local_model
 from agent_cli.inference.model import Model
 from agent_cli.screen.app import Activity, AgentCliApp
 from agent_cli.screen.banner import Banner
@@ -548,18 +547,22 @@ async def test_piece_of_a_reply_is_drawn_without_searching_the_screen(monkeypatc
 
 
 async def test_session_with_a_real_local_model_shows_its_reply(small_model_file: Path) -> None:
-    """The small real model is loaded in the background, replies on the screen and stops when esc is pressed."""
-    app = session_with(LocalModel(load_model(small_model_file)))
-    async with app.run_test() as pilot:
-        await wait_for_message_box(app, pilot)
-        await send("Once upon a time", app, pilot)
-        await wait_until(lambda: turns_on_screen(app)[0].reply.source != "", pilot)
-        await pilot.press("escape")
-        await wait_for_message_box(app, pilot)
-        shown_reply = turns_on_screen(app)[0].reply.source
-        assert shown_reply != ""
-        assert app.query_one(StatusLine).tokens_in_context > 0
-    assert app.conversation.turns[0].messages[1] == {"role": "assistant", "content": shown_reply}
+    """The small real model replies on the screen, stops when esc is pressed, and what it wrote is counted."""
+    model = open_local_model(small_model_file)
+    app = session_with(model)
+    try:
+        async with app.run_test() as pilot:
+            await wait_for_message_box(app, pilot)
+            await send("Once upon a time", app, pilot)
+            await wait_until(lambda: turns_on_screen(app)[0].reply.source != "", pilot)
+            await pilot.press("escape")
+            await wait_for_message_box(app, pilot)
+            shown_reply = turns_on_screen(app)[0].reply.source
+            assert shown_reply != ""
+            assert app.query_one(StatusLine).tokens_in_context > 0
+        assert app.conversation.turns[0].messages[1] == {"role": "assistant", "content": shown_reply}
+    finally:
+        model.close()
 
 
 async def test_enter_pressed_twice_sends_the_message_once() -> None:

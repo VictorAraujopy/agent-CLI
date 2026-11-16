@@ -1,19 +1,11 @@
 """Generation through an API: ApiModel, the Model that sends the conversation to a model on OpenRouter."""
 
-import json
-import threading
-from collections.abc import Iterable, Iterator
 from typing import Any
 
 import httpx
 
-from agent_cli.inference.model import (
-    THINKING_CLOSES,
-    THINKING_OPENS,
-    ContextFullError,
-    Model,
-    without_its_thinking,
-)
+from agent_cli.inference.chat_completions import ChatCompletionsModel, connection_failure, error_in_the_body
+from agent_cli.inference.model import ContextFullError
 
 
 def open_client(api_key: str) -> httpx.Client:
@@ -23,24 +15,6 @@ def open_client(api_key: str) -> httpx.Client:
         headers={"Authorization": f"Bearer {api_key}"},
         timeout=httpx.Timeout(connect=10, read=30, write=30, pool=10),
     )
-
-
-def connection_failure(error: httpx.TransportError) -> ConnectionError:
-    """Return the error for a connection to OpenRouter that failed, with its reason, or its kind when it has none."""
-    reason = str(error) or type(error).__name__
-    return ConnectionError(f"the connection to OpenRouter failed: {reason}")
-
-
-def error_in_the_body(response: httpx.Response) -> dict[str, Any]:
-    """Return the error in the body of a refusal, or its HTTP status when the body is not in OpenRouter's format."""
-    response.read()
-    try:
-        error = response.json()["error"]
-    except (ValueError, LookupError, TypeError):
-        error = None
-    if isinstance(error, dict):
-        return error
-    return {"message": f"HTTP {response.status_code} {response.reason_phrase}"}
 
 
 def explanation_in(error: dict[str, Any]) -> str:
@@ -74,7 +48,7 @@ def endpoints_that_keep_no_data(client: httpx.Client) -> list[dict[str, Any]]:
     try:
         answer = client.get("/endpoints/zdr")
     except httpx.TransportError as error:
-        raise connection_failure(error) from error
+        raise connection_failure("OpenRouter", error) from error
     if answer.status_code != 200:
         raise failure_reported(error_in_the_body(answer))
     return answer.json()["data"]
@@ -97,124 +71,36 @@ def open_api_model(client: httpx.Client, model_name: str) -> "ApiModel":
     return ApiModel(client, model_name, context_tokens_of(model_name, endpoints))
 
 
-def chunks_in(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
-    """Yield the chunk carried by each data line of a Server-Sent Events stream, up to the line that ends it."""
-    for line in lines:
-        field, _, value = line.partition(":")
-        if field != "data":
-            continue
-        data = value.strip()
-        if data == "[DONE]":
-            return
-        yield json.loads(data)
-
-
-def chunks_with_no_error(chunks: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-    """Yield the chunks of a reply, and raise the error OpenRouter reports in the place of one of them."""
-    for chunk in chunks:
-        error = chunk.get("error")
-        if error is not None:
-            raise failure_reported(error)
-        yield chunk
-
-
-class ApiModel(Model):
+class ApiModel(ChatCompletionsModel):
     """A model that runs on the providers of OpenRouter: each reply is one request, answered as a stream."""
+
+    server_name = "OpenRouter"
+    thinking_field = "reasoning"
 
     def __init__(self, client: httpx.Client, model_name: str, context_tokens: int) -> None:
         """Keep the client that reaches OpenRouter, the name of the model there and the size of its context."""
-        self.client = client
+        super().__init__(client, context_tokens)
         self.model_name = model_name
-        self.context_tokens = context_tokens
         self.thinking_effort = "max"
-        self.finish_reason: str | None = None
-        self.tokens_counted = 0
-        self.stop_requested = threading.Event()
 
-    def reply(self, messages: list[dict[str, str]]) -> Iterator[str]:
-        """Yield the reply to the conversation one piece of text at a time, as OpenRouter streams it."""
-        self.finish_reason = None
-        self.stop_requested.clear()
-        wrote_a_piece = False
-        try:
-            with self.client.stream("POST", "/chat/completions", json=self.request_for(messages)) as response:
-                if response.status_code != 200:
-                    raise failure_reported(error_in_the_body(response))
-                lines = self.lines_until_stopped(response)
-                chunks = chunks_with_no_error(chunks_in(lines))
-                for piece in self.text_pieces(chunks):
-                    wrote_a_piece = True
-                    yield piece
-        except ContextFullError:
-            if not wrote_a_piece:
-                raise
-            # The context filled after the reply started: the reply ends here, cut, with no error.
-            self.finish_reason = "length"
-        except httpx.TransportError as error:
-            raise connection_failure(error) from error
-
-    def request_for(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        """Return the body of the request that asks this model for the reply to the conversation."""
+    def fields_of_this_server(self) -> dict[str, Any]:
+        """Return what OpenRouter needs besides the conversation: the model, no data kept, and the thinking effort."""
         return {
             "model": self.model_name,
-            "messages": [without_its_thinking(message) for message in messages],
-            "stream": True,
             "provider": {"zdr": True, "data_collection": "deny"},
             "reasoning": {"effort": self.thinking_effort},
         }
 
-    def lines_until_stopped(self, response: httpx.Response) -> Iterator[str]:
-        """Yield the lines of the response as they arrive, and end at the first one that arrives after stop()."""
-        for line in response.iter_lines():
-            if self.stop_requested.is_set():
-                return
-            yield line
+    def failure_from(self, error: dict[str, Any]) -> Exception:
+        """Return the exception for an error OpenRouter reported: ContextFullError when the conversation does not fit."""
+        return failure_reported(error)
 
-    def text_pieces(self, chunks: Iterator[dict[str, Any]]) -> Iterator[str]:
-        """Yield the text of each chunk: the thinking first, between its tags, and then the answer."""
-        thinking_is_open = False
-        for chunk in chunks:
-            self.keep_how_the_reply_ended(chunk)
-            delta = chunk["choices"][0]["delta"]
-            thinking = delta.get("reasoning")
-            answer = delta.get("content")
-            if thinking and not thinking_is_open:
-                thinking_is_open = True
-                yield f"{THINKING_OPENS}\n"
-            if thinking:
-                yield thinking
-            if answer and thinking_is_open:
-                thinking_is_open = False
-                yield f"\n{THINKING_CLOSES}\n\n"
-            if answer:
-                yield answer
-        if thinking_is_open:
-            yield f"\n{THINKING_CLOSES}\n\n"
-
-    def keep_how_the_reply_ended(self, chunk: dict[str, Any]) -> None:
-        """Keep why the reply ended and the tokens OpenRouter counted for it, when the chunk carries them."""
-        finish_reason = chunk["choices"][0]["finish_reason"]
-        if finish_reason is not None:
-            self.finish_reason = finish_reason
+    def tokens_counted_in(self, chunk: dict[str, Any]) -> int | None:
+        """Return the tokens OpenRouter counted, which only the last chunk of a reply that reached its end carries."""
         usage = chunk.get("usage")
-        if usage is not None:
-            self.tokens_counted = usage["total_tokens"]
-
-    def stop(self) -> None:
-        """Ask the reply being written to end, with no error, as soon as it can; safe to call from any thread."""
-        self.stop_requested.set()
-
-    def reply_was_cut(self) -> bool:
-        """Tell whether the last reply ended because it reached a limit of tokens, not because the model finished it."""
-        return self.finish_reason == "length"
-
-    def tokens_in_use(self) -> int:
-        """Return the tokens of the last reply that reached its end: the conversation sent and the reply."""
-        return self.tokens_counted
-
-    def context_limit(self) -> int:
-        """Return how many tokens the conversation may take: the size of the model's context on OpenRouter."""
-        return self.context_tokens
+        if usage is None:
+            return None
+        return usage["total_tokens"]
 
     def thinking_options(self) -> tuple[str, ...]:
         """Return the choices for the thinking of a model on OpenRouter: its efforts, from none to the most."""

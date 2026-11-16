@@ -9,7 +9,6 @@ import pytest
 
 from agent_cli.inference.api import (
     ApiModel,
-    chunks_in,
     context_tokens_of,
     endpoints_that_keep_no_data,
     open_api_model,
@@ -403,18 +402,6 @@ def test_connection_that_drops_halfway_through_the_reply_is_reported_as_such() -
     assert next(reply) == "Once upon"
     with pytest.raises(ConnectionError, match="the connection to OpenRouter failed: connection reset"):
         next(reply)
-
-
-def test_only_data_lines_carry_chunks() -> None:
-    """Comments, blank lines and other fields are skipped, and a data line needs no space after the colon."""
-    lines = [": comment", "", "event: message", 'data: {"n": 1}', 'data:{"n": 2}', "id: 7"]
-    assert list(chunks_in(lines)) == [{"n": 1}, {"n": 2}]
-
-
-def test_stream_ends_at_the_done_mark() -> None:
-    """The mark that ends the stream is not read as a chunk, and nothing after it is read."""
-    lines = ['data: {"n": 1}', "data: [DONE]", 'data: {"n": 2}']
-    assert list(chunks_in(lines)) == [{"n": 1}]
 
 
 def test_endpoints_that_keep_no_data_are_asked_of_openrouter() -> None:

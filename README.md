@@ -2,7 +2,7 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. The model reads, writes and edits files and runs commands, and asks you first for anything that changes something. History is not implemented yet.
+> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. The model reads, writes and edits files and runs commands, and asks you first for anything that changes something. Every turn is saved in a history, and `agentcli -r` continues an earlier conversation of the folder.
 
 ## The idea
 
@@ -50,7 +50,7 @@ The parts, by the role each one plays:
 | Generation | Sends the conversation to `llama-server` or to OpenRouter and returns the response piece by piece, read the same way for both. It never prints anything. |
 | Conversation | Keeps the messages, which start with the system prompt, and runs each turn: asks for the generation, runs the tools each reply asks for once you allow them, and gives the results back to the model until a reply asks for none. |
 | Tools | Reading, writing and editing a file, and running a command. Checks the arguments the model wrote, runs the call and returns the result, or the reason it failed, for the model to read. The same tools for every model. |
-| History | Saves and restores conversations in the database. |
+| History | Saves each turn as it ends, in a SQLite file in your home folder, and reads back the conversations of a folder for `agentcli -r`. |
 | Commands | Session commands, which start with `/`: `/model` and `/think`. |
 | Screen | The terminal session: reads what you type and shows what arrives. |
 
@@ -95,6 +95,8 @@ Everything is set through environment variables, in a `.env` file that stays out
 | A turn whose tool results fill the context is kept | The tools already changed files, so the conversation keeps what they did, and the turn ends as a reply cut by the full context. The next turn cuts the oldest turns as usual. |
 | The system prompt in a text file, with its path in a variable | Each user writes their own without touching the code. A file takes a prompt of any size, which would be awkward to write and to read inside `.env`. |
 | A database only for history | It is the only thing that has to survive after the CLI closes. |
+| History in SQLite, one file in your home folder | `sqlite3` comes with Python, and one file keeps the conversations of every folder, each under the folder it happened in, as the tools act on that folder. Each turn is saved when it ends, so closing or a crash loses at most the turn being written. The cut of the context leaves turns out of what goes to the model, never out of the history. The system prompt is not saved: it is a setting, and a conversation continued later uses the prompt of that day. |
+| `agentcli -r` opens a list over the screen | The earlier conversations of the folder, the newest first: the arrows choose, `enter` continues one and `esc` starts a new one. The one chosen is drawn back on the screen and goes to the model with the next message, with the size it had in the context, so the cut works as before. |
 
 ### The accepted cost
 
@@ -141,6 +143,8 @@ With the virtual environment active (`source .venv/bin/activate`), or with `uv r
 agentcli
 ```
 
+`agentcli -r` (or `--resume`) first lists the earlier conversations of the folder you call it in, to continue one.
+
 The screen opens at once and the model loads in the background; the message box unlocks when it is ready. The banner then shows the model and the context it got, in tokens.
 
 | Key | What it does |
@@ -148,7 +152,7 @@ The screen opens at once and the model loads in the background; the message box 
 | `enter` | Sends the message. |
 | `esc` | Stops the turn: the reply being written, the command running, or the question about a tool, which counts as refused. What was written and done stays in the conversation. |
 | `y` / `n` | Allows or refuses the tool the screen asks about. |
-| `ctrl+q` | Quits. During the load of the model, the session closes as soon as the load ends. |
+| `ctrl+q` | Quits. During the load of the model, the session closes as soon as the load ends; during a turn, it stops the turn and closes once the turn is saved, and a second `ctrl+q` closes at once. |
 
 A message that starts with a slash, with the command right after it, is a command: the session runs it and the model never receives it. While you type one the message box changes color and suggests the rest (`→` accepts). A slash followed by a space, or anywhere else in the message, is ordinary text.
 
@@ -169,6 +173,7 @@ What the model thinks before it answers is shown above the reply, in a muted col
 - The log of that server, and the files that tell which session started each server, live in a folder of the temporary folder that only your user can open (`agent-cli-<your user id>`). On Linux, where every user shares the temporary folder, the CLI refuses a folder another user made or can write to.
 - An API model is only used when no local model is configured or when you pick one with `/model`. From then on, the conversation, including the system prompt, is sent to OpenRouter, and only to providers that keep no data.
 - A system prompt with personal content belongs in a file that stays out of git.
+- The history, `~/.agent-cli/history.db`, holds every conversation, with what the tools read and what the commands wrote. The file and its folder are created readable only by your user.
 - Splitting across two machines is off by default, for the reason explained above.
 - The model only asks; the CLI is the one that executes. Writing or editing a file and running a command always wait for `y`, and so does reading a file outside the folder the session started in.
 - A command runs with no input and with no terminal, so it never draws over the screen, and `esc` ends it together with everything it started.

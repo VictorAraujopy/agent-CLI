@@ -226,3 +226,36 @@ PermissionPrompt {
 .tool-result.denied {
     color: $warning;
 }
+
+/* The list of the earlier conversations that agentcli -r opens over the screen. */
+
+ConversationPicker {
+    align: center middle;
+}
+
+#picker {
+    width: 100;
+    max-width: 100%;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+    border: round $primary;
+    background: $background;
+}
+
+#picker-title {
+    margin: 0 0 1 0;
+    text-style: bold;
+}
+
+#picker OptionList {
+    height: auto;
+    max-height: 20;
+    border: none;
+    background: $background;
+}
+
+#picker-keys {
+    margin: 1 0 0 0;
+    color: $text-muted;
+}

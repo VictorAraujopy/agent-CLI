@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import tempfile
 import threading
 import time
 from collections.abc import Callable
@@ -11,9 +12,10 @@ from typing import Any
 import pytest
 from textual.dom import DOMNode
 from textual.pilot import Pilot
-from textual.widgets import Input, Static
+from textual.widgets import Input, OptionList, Static
 
 from agent_cli.agent.conversation import Conversation
+from agent_cli.history.queries import History
 from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.generation import open_local_model
 from agent_cli.inference.model import Model, ToolCall
@@ -21,6 +23,7 @@ from agent_cli.screen.app import Activity, AgentCliApp
 from agent_cli.screen.banner import Banner
 from agent_cli.screen.messages import Notice, Reply, Thinking, ToolView, TurnView, thinking_and_answer_so_far
 from agent_cli.screen.permission import PermissionPrompt
+from agent_cli.screen.resume import ConversationPicker
 from agent_cli.screen.status import StatusLine
 from agent_cli.tools.toolbox import Toolbox
 from scripted_model import ScriptedModel
@@ -31,8 +34,9 @@ SECONDS_TO_WAIT = 5
 
 
 def new_conversation() -> Conversation:
-    """Return a conversation for sessions that run no tool, so its toolbox points at no real folder."""
-    return Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")))
+    """Return a conversation for sessions that run no tool, with its history in a new temporary folder."""
+    folder = Path(tempfile.mkdtemp())
+    return Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")), History(folder / "history.db", folder))
 
 
 def session_with(model: Model) -> AgentCliApp:
@@ -695,7 +699,9 @@ async def test_model_that_fails_to_open_in_a_switch_leaves_the_session_on_the_on
 
 def session_in(folder: Path, model: Model) -> AgentCliApp:
     """Return the screen of a session whose model opens at once and whose tools act from the folder."""
-    return AgentCliApp(Conversation(SYSTEM_PROMPT, Toolbox(folder)), Catalog({MODEL_NAME: lambda: model}))
+    history_folder = Path(tempfile.mkdtemp())
+    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_folder / "history.db", folder))
+    return AgentCliApp(conversation, Catalog({MODEL_NAME: lambda: model}))
 
 
 def call(call_id: str, name: str, **arguments: object) -> ToolCall:
@@ -841,3 +847,118 @@ async def test_turn_cut_by_the_result_of_a_tool_is_reported(tmp_path: Path) -> N
         await send("read it", app, pilot)
         await wait_for_message_box(app, pilot)
         assert notices_on_screen(app) == ["reply cut: the model's context is full"]
+
+
+def resuming_session_in(folder: Path, model: Model, history_file: Path) -> AgentCliApp:
+    """Return the screen of a session opened with -r, whose history is kept in the file given."""
+    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_file, folder))
+    return AgentCliApp(conversation, Catalog({MODEL_NAME: lambda: model}), resume=True)
+
+
+async def test_resume_with_no_earlier_conversation_says_so_and_starts_a_new_one(tmp_path: Path) -> None:
+    """-r in a folder with no conversation shows no list, only a notice."""
+    app = resuming_session_in(tmp_path, ScriptedModel(["Ok."]), tmp_path / "history.db")
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        assert notices_on_screen(app) == ["no earlier conversation in this folder: a new one starts"]
+        assert len(app.screen_stack) == 1
+
+
+async def test_resume_lists_the_conversations_and_brings_back_the_one_chosen(tmp_path: Path) -> None:
+    """Enter on a conversation draws its turns, tools included, and the next message continues it."""
+    (tmp_path / "notes.txt").write_text("hello\n")
+    history_file = tmp_path / "history.db"
+    first_model = ScriptedModel(["Read."], tool_calls_by_reply=[[call("c1", "read_file", path="notes.txt")]])
+    earlier = session_in(tmp_path, first_model)
+    earlier.conversation.history = History(history_file, tmp_path)
+    async with earlier.run_test() as pilot:
+        await wait_for_message_box(earlier, pilot)
+        await send("read the notes", earlier, pilot)
+        await wait_for_message_box(earlier, pilot)
+    model = ScriptedModel(["Again."])
+    app = resuming_session_in(tmp_path, model, history_file)
+    async with app.run_test() as pilot:
+        await wait_until(lambda: isinstance(app.screen, ConversationPicker), pilot)
+        assert "read the notes" in str(app.screen.query_one(OptionList).get_option_at_index(0).prompt)
+        await pilot.press("enter")
+        await wait_until(lambda: notices_on_screen(app) == ["continuing: read the notes"], pilot)
+        (turn,) = turns_on_screen(app)
+        assert turn.user_text == "read the notes"
+        assert text_of(tools_on_screen(app)[0].children[0]) == "● read_file  notes.txt"
+        assert results_on_screen(app) == ["⎿ 1 line"]
+        assert app.query_one(StatusLine).tokens_in_context == first_model.tokens_in_use()
+        await wait_for_message_box(app, pilot)
+        await send("and now?", app, pilot)
+        await wait_for_message_box(app, pilot)
+    assert model.conversations_received[0][1]["content"] == "read the notes"
+    assert len(app.conversation.history.conversations_in_folder()) == 1
+
+
+async def test_esc_on_the_list_starts_a_new_conversation(tmp_path: Path) -> None:
+    """Esc closes the list and leaves the conversation empty, so the next turn starts another one."""
+    history_file = tmp_path / "history.db"
+    History(history_file, tmp_path).save_turn([{"role": "user", "content": "old"}], {}, 5)
+    model = ScriptedModel(["Ok."])
+    app = resuming_session_in(tmp_path, model, history_file)
+    async with app.run_test() as pilot:
+        await wait_until(lambda: isinstance(app.screen, ConversationPicker), pilot)
+        await pilot.press("escape")
+        await wait_for_message_box(app, pilot)
+        assert turns_on_screen(app) == []
+        await send("new", app, pilot)
+        await wait_for_message_box(app, pilot)
+    assert model.conversations_received[0][1:] == [{"role": "user", "content": "new"}]
+    assert len(app.conversation.history.conversations_in_folder()) == 2
+
+
+async def test_tool_kept_with_no_result_is_shown_without_one(tmp_path: Path) -> None:
+    """The history is a file outside the program: a call it holds with no result does not break the resume."""
+    history_file = tmp_path / "history.db"
+    asked = {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "a"}'}}
+    turn = [{"role": "user", "content": "read a"}, {"role": "assistant", "content": "", "tool_calls": [asked]}]
+    History(history_file, tmp_path).save_turn(turn, {}, 5)
+    app = resuming_session_in(tmp_path, ScriptedModel(["Ok."]), history_file)
+    async with app.run_test() as pilot:
+        await wait_until(lambda: isinstance(app.screen, ConversationPicker), pilot)
+        await pilot.press("enter")
+        await wait_until(lambda: notices_on_screen(app) == ["continuing: read a"], pilot)
+        assert len(tools_on_screen(app)) == 1
+        assert results_on_screen(app) == []
+
+
+async def test_quitting_during_a_reply_closes_once_the_turn_is_saved(tmp_path: Path) -> None:
+    """ctrl+q stops the reply and waits for the turn to be kept, so the model is not closed under it."""
+    model = ScriptedModel(["one ", "two"], hold_pieces=True)
+    app = session_in(tmp_path, model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("count", app, pilot)
+        await wait_until(lambda: model.reply_started.is_set(), pilot)
+        await pilot.press("ctrl+q")
+        assert model.stop_asked.is_set()
+        await wait_until(lambda: app.return_code is not None, pilot)
+    assert app.return_code == 0
+    assert len(app.conversation.history.conversations_in_folder()) == 1
+
+
+class ModelThatDoesNotStop(ScriptedModel):
+    """A model whose reply goes on after stop(), as one behind a server that hung."""
+
+    def stop(self) -> None:
+        """Ignore the stop."""
+
+
+async def test_second_quit_closes_without_waiting_for_the_turn(tmp_path: Path) -> None:
+    """When the turn does not end, a second ctrl+q closes the screen anyway."""
+    model = ModelThatDoesNotStop(["one ", "two"], hold_pieces=True)
+    app = session_in(tmp_path, model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("count", app, pilot)
+        await wait_until(lambda: model.reply_started.is_set(), pilot)
+        await pilot.press("ctrl+q")
+        assert message_box(app).placeholder == Activity.CLOSING_AFTER_THE_TURN.value
+        await pilot.press("ctrl+q")
+        await wait_until(lambda: app.return_code is not None, pilot)
+    model.allow_piece()
+    model.allow_piece()

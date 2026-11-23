@@ -4,6 +4,7 @@ import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
+from agent_cli.history.queries import History
 from agent_cli.inference.model import ContextFullError, Message, Model, ToolCall
 from agent_cli.tools.tool import Ending, ToolResult
 from agent_cli.tools.toolbox import Toolbox, ToolUse
@@ -75,10 +76,11 @@ def calls_with_no_result(messages: list[Message]) -> list[str]:
 class Conversation:
     """What is sent to the model: the system prompt first, then the turns that still fit in the context."""
 
-    def __init__(self, system_prompt: str, toolbox: Toolbox) -> None:
-        """Start a conversation that holds only the system prompt, offers the tools, and has no tokens counted yet."""
+    def __init__(self, system_prompt: str, toolbox: Toolbox, history: History) -> None:
+        """Start a conversation that holds only the system prompt, offers the tools, and saves each turn it keeps."""
         self.system_message = {"role": "system", "content": system_prompt}
         self.toolbox = toolbox
+        self.history = history
         self.turns: list[Turn] = []
         # The tokens the model counted in its context when the last turn ended. After a cut it is an estimate,
         # until the next turn ends and the model counts again.
@@ -87,6 +89,8 @@ class Conversation:
         self.stop_requested = threading.Event()
         # Whether the last turn ended because the context filled, in the middle of a reply or between two.
         self.turn_was_cut = False
+        # What each tool call of the turn being run gave, by the id of the call, for the history to keep.
+        self.tool_results: dict[str, ToolResult] = {}
 
     def messages(self) -> list[Message]:
         """Return every message to send, in order: the system prompt, then the messages of each turn."""
@@ -99,6 +103,11 @@ class Conversation:
         """Keep a finished turn, and the tokens the model counted in its context when the turn ended."""
         self.turns.append(Turn(messages))
         self.tokens_in_context = tokens_in_context_after_reply
+
+    def continue_from(self, turns: list[list[Message]], tokens_in_context: int) -> None:
+        """Take the turns of a conversation read back from the history, and the tokens it took when it was left."""
+        self.turns = [Turn(messages) for messages in turns]
+        self.tokens_in_context = tokens_in_context
 
     def is_full(self, context_limit: int) -> bool:
         """Tell whether the conversation passed the share of the context where the cut starts."""
@@ -124,6 +133,7 @@ class Conversation:
         """Send the user's message, yield each reply piece by piece and each tool it runs, and keep it all."""
         self.stop_requested.clear()
         self.turn_was_cut = False
+        self.tool_results = {}
         context_limit = model.context_limit()
         if self.is_full(context_limit):
             self.cut_oldest_turns(context_limit)
@@ -203,6 +213,7 @@ class Conversation:
             use = self.toolbox.read(call.name, call.arguments)
             yield ToolStarted(use)
             result = self.result_of(use, ask_permission)
+            self.tool_results[call.id] = result
             turn_messages.append(tool_message(call.id, result.text))
             yield ToolEnded(use, result)
 
@@ -217,8 +228,11 @@ class Conversation:
         return self.toolbox.run(use, self.stop_requested)
 
     def keep_turn(self, model: Model, turn_messages: list[Message]) -> None:
-        """Keep the messages of the turn, every tool call with a result, and the tokens the model holds now."""
+        """Keep the messages of the turn, every tool call with a result, in the history and in the conversation."""
         for call_id in calls_with_no_result(turn_messages):
             turn_messages.append(tool_message(call_id, NOT_RUN.text))
+            self.tool_results[call_id] = NOT_RUN
         self.turn_was_cut = self.turn_was_cut or model.reply_was_cut()
-        self.add_turn(turn_messages, model.tokens_in_use())
+        tokens_in_context = model.tokens_in_use()
+        self.history.save_turn(turn_messages, self.tool_results, tokens_in_context)
+        self.add_turn(turn_messages, tokens_in_context)

@@ -14,11 +14,13 @@ from textual.widgets import Input
 
 from agent_cli.agent.conversation import Conversation, MessageTooLongError, ToolEnded, ToolStarted
 from agent_cli.commands import completions, is_command, run_command
+from agent_cli.history.queries import SavedConversation, SavedTurn
 from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.model import Model
 from agent_cli.screen.banner import Banner
 from agent_cli.screen.messages import Notice, TurnView
 from agent_cli.screen.permission import PermissionAnswer, PermissionPrompt
+from agent_cli.screen.resume import ConversationPicker
 from agent_cli.screen.status import StatusLine
 from agent_cli.screen.theme import THEME_NAME, build_theme
 from agent_cli.tools.tool import ToolResult
@@ -33,6 +35,7 @@ class Activity(Enum):
     GENERATING = "Generating…"
     WAITING_FOR_PERMISSION = "Answer above: may the tool run?"
     CLOSING = "Closing as soon as the model is loaded…"
+    CLOSING_AFTER_THE_TURN = "Closing as soon as the turn is saved…   ctrl+q closes now"
 
 
 class AgentCliApp(App):
@@ -110,13 +113,15 @@ class AgentCliApp(App):
         turn: TurnView
         reason: str
 
-    def __init__(self, conversation: Conversation, catalog: Catalog) -> None:
-        """Keep the conversation and the catalog of the models the session can use."""
+    def __init__(self, conversation: Conversation, catalog: Catalog, resume: bool = False) -> None:
+        """Keep the conversation, the catalog of the models, and whether to offer the earlier conversations first."""
         super().__init__()
         self.conversation = conversation
         self.catalog = catalog
+        self.resume = resume
         self.activity = Activity.LOADING_MODEL
         self.close_when_loaded = False
+        self.close_when_turn_ends = False
         # The line that asks whether a tool may run, while the user has not answered it.
         self.permission_prompt: PermissionPrompt | None = None
 
@@ -142,6 +147,51 @@ class AgentCliApp(App):
     def start_loading_model(self) -> None:
         """Lock the message box and start opening the first model of the catalog in the background."""
         self.open_in_background(self.catalog.names()[0])
+
+    @on(Mount)
+    async def offer_earlier_conversations(self) -> None:
+        """With -r, list the earlier conversations of the folder over the screen, or say there is none."""
+        if not self.resume:
+            return
+        earlier_conversations = self.conversation.history.conversations_in_folder()
+        if not earlier_conversations:
+            await self.show_notice("no earlier conversation in this folder: a new one starts", tone="muted")
+            return
+        self.push_screen(ConversationPicker(earlier_conversations), self.continue_conversation)
+
+    async def continue_conversation(self, chosen: SavedConversation | None) -> None:
+        """Bring back the conversation chosen, to the model and to the screen; with none, the new one goes on."""
+        if chosen is None:
+            return
+        saved_turns = self.conversation.history.resume(chosen.id)
+        self.conversation.continue_from([turn.messages for turn in saved_turns], chosen.tokens_in_context)
+        for saved_turn in saved_turns:
+            await self.show_saved_turn(saved_turn)
+        # A model still loading shows the context when it is loaded; one already loaded shows it now.
+        model_in_use = self.catalog.model_in_use
+        if model_in_use is not None:
+            self.show_context_in_use(model_in_use.context_limit())
+        await self.show_notice(f"continuing: {chosen.title}", tone="muted")
+        self.query_one("#conversation").anchor()
+
+    async def show_saved_turn(self, saved_turn: SavedTurn) -> None:
+        """Draw a turn read back from the history as it was shown: the message, the replies and their tools."""
+        user_message, *later_messages = saved_turn.messages
+        turn = TurnView(user_message["content"])
+        await self.query_one("#conversation-content").mount(turn)
+        for message in later_messages:
+            if message["role"] != "assistant":
+                continue
+            if message["content"]:
+                await turn.add_piece(message["content"])
+            for call in message.get("tool_calls", []):
+                use = self.conversation.toolbox.read(call["function"]["name"], call["function"]["arguments"])
+                await turn.add_tool(use)
+                # The file is outside the program: a call kept with no result is shown without one.
+                result = saved_turn.tool_results.get(call["id"])
+                if result is not None:
+                    await turn.show_tool_result(result)
+        await turn.finish()
 
     def open_in_background(self, name: str) -> None:
         """Lock the message box and start opening the named model in a background thread."""
@@ -246,11 +296,17 @@ class AgentCliApp(App):
         return answer.wait(self.conversation.stop_requested)
 
     async def action_quit(self) -> None:
-        """Close the screen, or leave that for when the model is loaded, if it is still loading."""
+        """Close the screen; while the model loads or a turn runs, close as soon as that ends."""
         # The thread that loads cannot be stopped, and the process only ends after it.
         if self.activity in (Activity.LOADING_MODEL, Activity.CLOSING):
             self.close_when_loaded = True
             self.show_activity(Activity.CLOSING)
+            return
+        # The model is closed right after the screen, so a turn still running would fail before it is saved.
+        if self.activity in (Activity.GENERATING, Activity.WAITING_FOR_PERMISSION):
+            self.close_when_turn_ends = True
+            self.action_stop_reply()
+            self.show_activity(Activity.CLOSING_AFTER_THE_TURN)
             return
         self.exit()
 
@@ -313,6 +369,14 @@ class AgentCliApp(App):
             await self.show_notice("reply cut: the model's context is full", tone="muted")
         self.show_context_in_use(ended.context_limit)
         self.show_activity(Activity.WAITING_FOR_MESSAGE)
+
+    @on(ReplyEnded)
+    @on(MessageTooLong)
+    @on(ReplyFailed)
+    def close_if_asked_during_the_turn(self, ended: Message) -> None:
+        """Close the screen when ctrl+q was pressed while the turn that just ended ran."""
+        if self.close_when_turn_ends:
+            self.exit()
 
     @on(MessageTooLong)
     async def refuse_long_message(self, refused: MessageTooLong) -> None:

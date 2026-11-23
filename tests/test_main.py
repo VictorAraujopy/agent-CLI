@@ -1,5 +1,7 @@
 """Tests for the start of the program: the models it configures, the session it builds, and how the program ends."""
 
+import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,10 +34,11 @@ class ScreenThatClosedWithAnError:
 
     return_code = 1
 
-    def __init__(self, conversation: Conversation, catalog: Catalog) -> None:
-        """Keep the conversation and the catalog the program built the session with."""
+    def __init__(self, conversation: Conversation, catalog: Catalog, resume: bool = False) -> None:
+        """Keep the conversation, the catalog and the choice to resume the program built the session with."""
         self.conversation = conversation
         self.catalog = catalog
+        self.resume = resume
         self.was_run = False
 
     def run(self) -> None:
@@ -79,17 +82,22 @@ def settings_for(model_path: Path | None, api_key: str | None, api_models: tuple
 
 
 def screens_built_by_main(
-    monkeypatch: pytest.MonkeyPatch, settings: Settings, screen_class: type[ScreenThatClosedWithAnError]
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    screen_class: type[ScreenThatClosedWithAnError],
+    arguments: tuple[str, ...] = (),
 ) -> list[ScreenThatClosedWithAnError]:
-    """Make the program read the given settings and build its screen from the given class; return the screens built."""
+    """Make the program read the settings and the arguments, and build its screen from the class; return the screens."""
     screens_built: list[ScreenThatClosedWithAnError] = []
 
-    def build_screen(conversation: Conversation, catalog: Catalog) -> ScreenThatClosedWithAnError:
+    def build_screen(conversation: Conversation, catalog: Catalog, resume: bool) -> ScreenThatClosedWithAnError:
         """Build the stand-in screen and keep it, so the test can look at it after the program ends."""
-        screen = screen_class(conversation, catalog)
+        screen = screen_class(conversation, catalog, resume)
         screens_built.append(screen)
         return screen
 
+    monkeypatch.setattr(sys, "argv", ["agentcli", *arguments])
+    monkeypatch.setattr(main, "history_file", lambda: Path(tempfile.mkdtemp()) / "history.db")
     monkeypatch.setattr(main, "load_settings", lambda: settings)
     monkeypatch.setattr(main, "AgentCliApp", build_screen)
     return screens_built
@@ -189,3 +197,38 @@ def test_session_opens_its_models_and_closes_them_when_it_ends(
     assert isinstance(screen.model_opened, LocalModel)
     assert screen.model_opened.context_limit() == SMALL_MODEL_TRAINED_CONTEXT
     assert screen.model_opened.server.process.poll() is not None
+
+
+@pytest.mark.parametrize(("arguments", "resume"), [((), False), (("-r",), True), (("--resume",), True)])
+def test_r_opens_the_session_on_the_list_of_earlier_conversations(
+    monkeypatch: pytest.MonkeyPatch, arguments: tuple[str, ...], resume: bool
+) -> None:
+    """agentcli -r, or --resume, asks the screen to offer the earlier conversations first."""
+    settings = settings_with(Path("any.gguf"))
+    screens = screens_built_by_main(monkeypatch, settings, ScreenThatClosedWithAnError, arguments)
+    with pytest.raises(SystemExit):
+        main.main()
+    assert screens[0].resume is resume
+
+
+def test_unknown_argument_ends_the_program_before_anything_opens(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An argument agentcli does not know ends it with the usage, before the settings are read."""
+    screens = screens_built_by_main(monkeypatch, settings_with(Path("any.gguf")), ScreenThatClosedWithAnError, ("-x",))
+    monkeypatch.setattr(main, "load_settings", lambda: pytest.fail("the settings were read"))
+    with pytest.raises(SystemExit) as ending:
+        main.main()
+    assert ending.value.code == 2
+    assert screens == []
+
+
+def test_history_is_kept_in_the_home_folder_by_the_folder_agentcli_runs_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One file in the user's home folder keeps every conversation, each under the folder it happened in."""
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert main.history_file() == tmp_path / "home" / ".agent-cli" / "history.db"
+    screens = screens_built_by_main(monkeypatch, settings_with(Path("any.gguf")), ScreenThatClosedWithAnError)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit):
+        main.main()
+    assert screens[0].conversation.history.working_folder == str(tmp_path.resolve())

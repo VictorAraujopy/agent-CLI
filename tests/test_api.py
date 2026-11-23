@@ -14,7 +14,7 @@ from agent_cli.inference.api import (
     open_api_model,
     open_client,
 )
-from agent_cli.inference.model import ContextFullError
+from agent_cli.inference.model import ContextFullError, ToolCall
 
 OPENROUTER_API = "https://openrouter.ai/api/v1"
 QUESTION = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Say hello."}]
@@ -456,3 +456,88 @@ def test_model_no_provider_serves_without_keeping_data_is_refused(endpoints: lis
     """A name that is not in the list, or that has no context size there, raises an error that names the model."""
     with pytest.raises(ValueError, match="author/model"):
         context_tokens_of("author/model", endpoints)
+
+
+READ_FILE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read_file",
+        "description": "Read a text file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+    },
+}
+
+
+def tool_call_part(index: int, arguments: str, call_id: str | None = None, name: str | None = None) -> dict[str, Any]:
+    """Return a chunk with one part of a tool call: the first part of a call brings its id and name."""
+    part: dict[str, Any] = {"index": index, "function": {"arguments": arguments}}
+    if call_id is not None:
+        part = {**part, "id": call_id, "type": "function", "function": {"name": name, "arguments": arguments}}
+    return {"choices": [{"index": 0, "delta": {"tool_calls": [part]}, "finish_reason": None}]}
+
+
+def lines_of_a_reply_with_two_tool_calls(finish_reason: str = "tool_calls") -> list[str]:
+    """Return a stream with a piece of text and two tool calls whose parts come mixed, then the end."""
+    return [
+        line_with(chunk_with("Let me look.")),
+        line_with(tool_call_part(0, '{"pa', call_id="call-a", name="read_file")),
+        line_with(tool_call_part(1, '{"command"', call_id="call-b", name="run_command")),
+        line_with(tool_call_part(0, 'th": "a.txt"}')),
+        line_with(tool_call_part(1, ': "ls"}')),
+        line_with(chunk_with("", finish_reason)),
+        "data: [DONE]",
+    ]
+
+
+def test_tools_offered_go_in_the_request_and_no_tools_send_no_list() -> None:
+    """The tools of a reply go in its request as they were given; a reply offered none sends no list of tools."""
+    openrouter = FakeOpenRouter(lines_of_a_short_reply())
+    model = openrouter.model()
+    list(model.reply(QUESTION, [READ_FILE_TOOL]))
+    assert json.loads(openrouter.requests[-1].content)["tools"] == [READ_FILE_TOOL]
+    list(model.reply(QUESTION))
+    assert "tools" not in json.loads(openrouter.requests[-1].content)
+
+
+def test_tool_calls_are_joined_from_their_parts_in_the_order_of_the_reply() -> None:
+    """Each call gets its id and name from its first part and its arguments from all of them, after the text."""
+    model = FakeOpenRouter(lines_of_a_reply_with_two_tool_calls()).model()
+    assert list(model.reply(QUESTION, [READ_FILE_TOOL])) == ["Let me look."]
+    assert model.tool_calls() == [
+        ToolCall("call-a", "read_file", '{"path": "a.txt"}'),
+        ToolCall("call-b", "run_command", '{"command": "ls"}'),
+    ]
+
+
+def test_reply_cut_by_its_limit_asks_for_no_tool() -> None:
+    """A reply that ended at a limit of tokens may have cut the arguments of a call, so it runs none."""
+    model = FakeOpenRouter(lines_of_a_reply_with_two_tool_calls("length")).model()
+    list(model.reply(QUESTION, [READ_FILE_TOOL]))
+    assert model.tool_calls() == []
+
+
+def test_reply_stopped_halfway_asks_for_no_tool() -> None:
+    """A reply stopped before its end runs none of the calls, even when all their parts already arrived."""
+    lines = [
+        line_with(tool_call_part(0, '{"path": "a.txt"}', call_id="call-a", name="read_file")),
+        line_with(chunk_with("Reading.")),
+        line_with(chunk_with("", "tool_calls")),
+        "data: [DONE]",
+    ]
+    model = FakeOpenRouter(lines).model()
+    reply = model.reply(QUESTION, [READ_FILE_TOOL])
+    assert next(reply) == "Reading."
+    model.stop()
+    list(reply)
+    assert model.tool_call_parts != {}
+    assert model.tool_calls() == []
+
+
+def test_tool_calls_of_a_reply_are_forgotten_by_the_next_one() -> None:
+    """A reply that asks for no tool does not hand over the calls of the reply before it."""
+    openrouter = FakeOpenRouter(lines_of_a_reply_with_two_tool_calls())
+    model = openrouter.model()
+    list(model.reply(QUESTION, [READ_FILE_TOOL]))
+    openrouter.lines = lines_of_a_short_reply()
+    list(model.reply(QUESTION, [READ_FILE_TOOL]))
+    assert model.tool_calls() == []

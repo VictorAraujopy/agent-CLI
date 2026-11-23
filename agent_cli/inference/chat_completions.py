@@ -3,7 +3,7 @@
 import json
 import threading
 from abc import abstractmethod
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
 import httpx
@@ -12,7 +12,9 @@ from agent_cli.inference.model import (
     THINKING_CLOSES,
     THINKING_OPENS,
     ContextFullError,
+    Message,
     Model,
+    ToolCall,
     without_its_thinking,
 )
 
@@ -62,6 +64,8 @@ class ChatCompletionsModel(Model):
         self.finish_reason: str | None = None
         self.tokens_counted = 0
         self.stop_requested = threading.Event()
+        # The tool calls of the reply being read, by their index in it, as their parts arrive.
+        self.tool_call_parts: dict[int, dict[str, str]] = {}
 
     @abstractmethod
     def fields_of_this_server(self) -> dict[str, Any]:
@@ -75,13 +79,15 @@ class ChatCompletionsModel(Model):
     def tokens_counted_in(self, chunk: dict[str, Any]) -> int | None:
         """Return the tokens in the context the server counted in this chunk, or None when it carries no count."""
 
-    def reply(self, messages: list[dict[str, str]]) -> Iterator[str]:
+    def reply(self, messages: list[Message], tools: Sequence[dict[str, Any]] = ()) -> Iterator[str]:
         """Yield the reply to the conversation one piece of text at a time, as the server streams it."""
         self.finish_reason = None
+        self.tool_call_parts = {}
         self.stop_requested.clear()
         wrote_a_piece = False
+        request = self.request_for(messages, tools)
         try:
-            with self.client.stream("POST", "/chat/completions", json=self.request_for(messages)) as response:
+            with self.client.stream("POST", "/chat/completions", json=request) as response:
                 if response.status_code != 200:
                     raise self.failure_from(error_in_the_body(response))
                 lines = self.lines_until_stopped(response)
@@ -97,13 +103,17 @@ class ChatCompletionsModel(Model):
         except httpx.TransportError as error:
             raise connection_failure(self.server_name, error) from error
 
-    def request_for(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    def request_for(self, messages: list[Message], tools: Sequence[dict[str, Any]]) -> dict[str, Any]:
         """Return the body of the request that asks the server for the reply to the conversation."""
-        return {
+        request = {
             "messages": [without_its_thinking(message) for message in messages],
             "stream": True,
             **self.fields_of_this_server(),
         }
+        # A server may refuse an empty list of tools, so a reply offered none sends no list.
+        if tools:
+            request["tools"] = list(tools)
+        return request
 
     def chunks_with_no_error(self, chunks: Iterable[dict[str, Any]]) -> Iterator[dict[str, Any]]:
         """Yield the chunks of a reply, and raise the error the server reports in the place of one of them."""
@@ -129,6 +139,7 @@ class ChatCompletionsModel(Model):
             if not chunk.get("choices"):
                 continue
             delta = chunk["choices"][0]["delta"]
+            self.keep_tool_call_parts(delta)
             thinking = delta.get(self.thinking_field)
             answer = delta.get("content")
             if thinking and not thinking_is_open:
@@ -152,6 +163,23 @@ class ChatCompletionsModel(Model):
         tokens = self.tokens_counted_in(chunk)
         if tokens is not None:
             self.tokens_counted = tokens
+
+    def keep_tool_call_parts(self, delta: dict[str, Any]) -> None:
+        """Join the parts of each tool call in the delta: its id and name come once, its arguments in pieces."""
+        for part in delta.get("tool_calls") or []:
+            call = self.tool_call_parts.setdefault(part.get("index", 0), {"id": "", "name": "", "arguments": ""})
+            function = part.get("function") or {}
+            call["id"] = part.get("id") or call["id"]
+            call["name"] = function.get("name") or call["name"]
+            call["arguments"] += function.get("arguments") or ""
+
+    def tool_calls(self) -> list[ToolCall]:
+        """Return the tools the last reply asked to run, in order; none when it was stopped or cut."""
+        # A reply stopped or cut may end in the middle of the arguments of a call, which would run half written.
+        if self.finish_reason is None or self.finish_reason == "length":
+            return []
+        calls_in_order = [self.tool_call_parts[index] for index in sorted(self.tool_call_parts)]
+        return [ToolCall(call["id"], call["name"], call["arguments"]) for call in calls_in_order]
 
     def stop(self) -> None:
         """Ask the reply being written to end, with no error, as soon as it can; safe to call from any thread."""

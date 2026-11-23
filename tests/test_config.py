@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_cli import config
-from agent_cli.config import build_settings, load_settings, read_variables
+from agent_cli.config import build_settings, check_models_configured, load_settings, read_variables
 
 
 def clear_variables(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,3 +149,34 @@ def test_every_variable_of_the_env_example_reaches_the_settings() -> None:
     the_filled_value_in_each_type = [config.PROJECT_FOLDER / "12345", ("12345",), "12345"]
     assert len(names_in_example) == len(values)
     assert all(value in the_filled_value_in_each_type for value in values)
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        {"AGENT_CLI_API_MODELS": "author/model"},
+        {"AGENT_CLI_MODEL_PATH": "model.gguf", "AGENT_CLI_API_MODELS": "author/model"},
+    ],
+)
+def test_api_models_without_a_key_are_refused(variables: dict[str, str]) -> None:
+    """API models configured with no key end the program with the variable to set, even next to a local model."""
+    with pytest.raises(SystemExit, match="AGENT_CLI_API_KEY"):
+        check_models_configured(build_settings(variables))
+
+
+def test_settings_with_no_model_are_refused() -> None:
+    """With no local model and no API model the program ends, naming the variables that configure one."""
+    with pytest.raises(SystemExit, match="AGENT_CLI_MODEL_PATH or AGENT_CLI_API_MODELS"):
+        check_models_configured(build_settings({}))
+
+
+@pytest.mark.parametrize(
+    "variables",
+    [
+        {"AGENT_CLI_MODEL_PATH": "model.gguf"},
+        {"AGENT_CLI_API_KEY": "the-key", "AGENT_CLI_API_MODELS": "author/model"},
+    ],
+)
+def test_a_local_model_or_api_models_with_their_key_are_accepted(variables: dict[str, str]) -> None:
+    """A local model alone, or API models with their key, are enough to start a session."""
+    check_models_configured(build_settings(variables))

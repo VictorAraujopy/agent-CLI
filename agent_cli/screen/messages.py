@@ -3,10 +3,15 @@
 from markdown_it import MarkdownIt
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.content import Content
 from textual.widgets import Markdown, Static
 from textual.widgets.markdown import MarkdownStream
 
 from agent_cli.inference.model import THINKING_CLOSES, THINKING_OPENS, thinking_and_answer
+from agent_cli.screen.permission import PermissionPrompt
+from agent_cli.screen.theme import MUTED_MARKUP
+from agent_cli.tools.tool import ToolResult
+from agent_cli.tools.toolbox import ToolUse
 
 
 class UserMessage(Horizontal):
@@ -96,17 +101,58 @@ class Notice(Static):
         super().__init__(text, classes=tone, markup=False)
 
 
+def style_of_preview_line(line: str) -> str:
+    """Return the color of a line of a tool's preview: + comes into a file, - leaves it, the rest is muted."""
+    if line.startswith("+ "):
+        return "$success"
+    if line.startswith("- "):
+        return "$error"
+    return MUTED_MARKUP
+
+
+def result_lines(summary: str) -> str:
+    """Return the summary of a tool's result as it is shown: its first line after the mark, the rest under it."""
+    first_line, *other_lines = summary.splitlines() or [""]
+    lines = [f"⎿ {first_line}"] + [f"  {line}" for line in other_lines]
+    return "\n".join(lines)
+
+
+class ToolView(Vertical):
+    """A tool a reply asked for: its name and what it acts on, what it would change, and how the call ended."""
+
+    def __init__(self, use: ToolUse) -> None:
+        """Keep the call, as the toolbox read it."""
+        super().__init__()
+        self.use = use
+
+    def compose(self) -> ComposeResult:
+        """Yield the name of the tool with what it acts on and, for a tool that changes a file, the lines it changes."""
+        yield Static(Content.assemble(("● ", "$primary"), (self.use.name, "bold"), "  ", self.use.summary))
+        if self.use.preview:
+            preview_lines = self.use.preview.splitlines()
+            styled = [Content.styled(line, style_of_preview_line(line)) for line in preview_lines]
+            yield Static(Content("\n").join(styled), classes="tool-preview")
+
+    async def show_result(self, result: ToolResult) -> None:
+        """Show under the tool how the call ended: the summary of its result, in the color of its ending."""
+        ending = result.ending.name.lower()
+        await self.mount(Static(result_lines(result.summary), classes=f"tool-result {ending}", markup=False))
+
+
 class TurnView(Vertical):
-    """One turn as the screen shows it: the user's message and, under it, the model's thinking and its reply."""
+    """One turn as the screen shows it: the user's message, and under it each reply and the tools it ran."""
 
     def __init__(self, user_text: str) -> None:
         """Keep the user's text and start with nothing written by the model."""
         super().__init__()
         self.user_text = user_text
-        # Everything the model wrote in this turn, thinking included, as it arrived.
+        # Everything the model wrote in the reply being shown, thinking included, as it arrived.
         self.written = ""
         self.thinking = Thinking()
         self.reply = Reply()
+        # The tool shown last. A piece that arrives after a tool belongs to the next reply, shown under it.
+        self.last_tool: ToolView | None = None
+        self.reply_is_over = False
 
     def compose(self) -> ComposeResult:
         """Yield the user's message and, under it, the model's thinking and its reply."""
@@ -116,11 +162,38 @@ class TurnView(Vertical):
 
     async def add_piece(self, piece: str) -> None:
         """Add one piece of what the model writes: to the thinking, or to the reply once the thinking is over."""
+        if self.reply_is_over:
+            await self.start_next_reply()
         answer_before = thinking_and_answer_so_far(self.written)[1]
         self.written += piece
         thinking, answer = thinking_and_answer_so_far(self.written)
         self.thinking.show(thinking)
         await self.reply.add_piece(answer[len(answer_before) :])
+
+    async def start_next_reply(self) -> None:
+        """Show the next reply of the turn, with its own thinking, under the tools the last one ran."""
+        self.written = ""
+        self.thinking = Thinking()
+        self.reply = Reply()
+        self.reply_is_over = False
+        await self.mount(self.thinking, self.reply)
+
+    async def add_tool(self, use: ToolUse) -> None:
+        """Draw what is still waiting of the reply, and show under it the tool it asked for."""
+        await self.reply.finish()
+        self.reply_is_over = True
+        self.last_tool = ToolView(use)
+        await self.mount(self.last_tool)
+
+    async def ask_permission(self, prompt: PermissionPrompt) -> None:
+        """Show, under the tool shown last, the line that asks whether it may run."""
+        if self.last_tool is not None:
+            await self.last_tool.mount(prompt)
+
+    async def show_tool_result(self, result: ToolResult) -> None:
+        """Show how the call of the tool shown last ended."""
+        if self.last_tool is not None:
+            await self.last_tool.show_result(result)
 
     async def finish(self) -> None:
         """Draw what is still waiting; the turn gets no more pieces after this."""

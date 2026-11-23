@@ -1,31 +1,32 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
 
 [project]
 name = "agent-cli"
 version = "0.1.0"
 description = "Terminal agent for GGUF or API models"
 requires-python = ">=3.12"
-# The list of dependencies lives in requirements.txt only, and is read from there.
-dynamic = ["dependencies"]
+# A local model also needs the llama-server program of llama.cpp on the PATH: see "Installation" in the README.
+dependencies = [
+    "textual==8.2.8",  # draws the screen and reads the keyboard; the terminal application framework
+    "python-dotenv==1.2.4",  # reads the .env file; the parser for the KEY=value format
+    "httpx==0.28.1",  # talks to llama-server and to OpenRouter and reads the reply as it arrives; the HTTP client
+]
 
 # The command the installation creates: typing agentcli calls main() of the main.py at the project root.
 [project.scripts]
 agentcli = "main:main"
 
-[tool.setuptools]
-py-modules = ["main"]
+# Only for working on the code: uv sync installs them, and an installation of the CLI alone does not.
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",  # runs the tests; the test runner
+]
 
-[tool.setuptools.packages.find]
-include = ["agent_cli*"]
-
-[tool.setuptools.dynamic]
-dependencies = { file = ["requirements.txt"] }
-
-# The files that are not Python and that the code reads: the stylesheet of the screen and the default system prompt.
-[tool.setuptools.package-data]
-agent_cli = ["screen/*.tcss", "agent/*.md"]
+# The package, with the stylesheet and the default system prompt inside it, and the main.py at the root.
+[tool.hatch.build.targets.wheel]
+only-include = ["agent_cli", "main.py"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

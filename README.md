@@ -2,7 +2,7 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. Tools and history are not implemented yet.
+> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. The model reads, writes and edits files and runs commands, and asks you first for anything that changes something. History is not implemented yet.
 
 ## The idea
 
@@ -48,8 +48,8 @@ The parts, by the role each one plays:
 | Model catalog | Lists the models that are available, the local one and the API ones, and hands over the one in use. |
 | Loading | Local model only. Starts `llama-server` with the `.gguf`, on one machine or split across two, and stops it. |
 | Generation | Sends the conversation to `llama-server` or to OpenRouter and returns the response piece by piece, read the same way for both. It never prints anything. |
-| Conversation | Keeps the messages, which start with the system prompt, and runs each turn: asks for the generation and handles tool requests. |
-| Tools | Detects when the model asked for a tool, runs it and returns the result. The same tools for every model. |
+| Conversation | Keeps the messages, which start with the system prompt, and runs each turn: asks for the generation, runs the tools each reply asks for once you allow them, and gives the results back to the model until a reply asks for none. |
+| Tools | Reading, writing and editing a file, and running a command. Checks the arguments the model wrote, runs the call and returns the result, or the reason it failed, for the model to read. The same tools for every model. |
 | History | Saves and restores conversations in the database. |
 | Commands | Session commands, which start with `/`: `/model` and `/think`. |
 | Screen | The terminal session: reads what you type and shows what arrives. |
@@ -88,6 +88,11 @@ Everything is set through environment variables, in a `.env` file that stays out
 | Variables prefixed with `AGENT_CLI_` | The CLI only uses an API when a variable written for this CLI says so. A key exported for another tool, such as `OPENROUTER_API_KEY`, is never picked up by accident. |
 | Switching models inside the session | Different tasks suit different models, and loading a local model is slow, so restarting the CLI just to switch would waste that time. |
 | The same tools for every model | A model is chosen for how well it does the task, not for what it is allowed to do. |
+| Four tools, all for code | `read_file`, `write_file`, `edit_file` and `run_command` cover the work of a coding agent; anything else a command can do. They are offered to the model in the chat completions format, and `llama-server` and OpenRouter hand back the calls in that same format, so no tool format is written for one model. |
+| A tool that changes something waits for you | Writing or editing a file and running a command always ask first, and `y` or `n` answers. Reading asks only for a file outside the folder the session started in, which may hold what you never meant to share with the model. A refusal, or `esc`, ends the turn: the model is not asked again, and the calls of its reply that did not run are told so. |
+| Tools act from the folder you called `agentcli` in | Relative paths start there and commands run there, as they would in your shell. |
+| Long files and outputs reach the model in parts | A file comes in parts of at most 500 lines and 40,000 characters, each telling where the next starts, so one read never fills a small context. A command's output keeps its last 20,000 characters, where errors and summaries usually are. A command gets no input, runs in a session of its own, and is ended after 120 seconds. |
+| A turn whose tool results fill the context is kept | The tools already changed files, so the conversation keeps what they did, and the turn ends as a reply cut by the full context. The next turn cuts the oldest turns as usual. |
 | The system prompt in a text file, with its path in a variable | Each user writes their own without touching the code. A file takes a prompt of any size, which would be awkward to write and to read inside `.env`. |
 | A database only for history | It is the only thing that has to survive after the CLI closes. |
 
@@ -109,15 +114,13 @@ The other machine must be running `ggml-rpc-server`, a program that ships with l
 
 ## Installation
 
-Requires Python 3.12, and, for a local model, `llama-server` on the PATH.
+Requires [uv](https://docs.astral.sh/uv/), and, for a local model, `llama-server` on the PATH.
 
 ```bash
-python3.12 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e .
+uv sync
 ```
 
-`pip install -e .` creates the `agentcli` command. It runs the code of this folder and reads the `.env` of this folder, whatever directory you call it from.
+`uv sync` creates `.venv` with Python 3.12, the version in `.python-version`, and installs there the versions written in `uv.lock`, the CLI itself and the `agentcli` command. The command runs the code of this folder and reads the `.env` of this folder, whatever directory you call it from.
 
 The CLI passes options to `llama-server` that change between versions of llama.cpp, and it is tested with commit `709fe75`. Build that version from the sources:
 
@@ -132,7 +135,7 @@ Metal is on by default on a Mac; for an NVIDIA GPU add `-DGGML_CUDA=ON` to the f
 
 ## Running
 
-With the virtual environment active:
+With the virtual environment active (`source .venv/bin/activate`), or with `uv run agentcli` from the project folder:
 
 ```bash
 agentcli
@@ -143,7 +146,8 @@ The screen opens at once and the model loads in the background; the message box 
 | Key | What it does |
 |---|---|
 | `enter` | Sends the message. |
-| `esc` | Stops the reply being written. What was written stays in the conversation. |
+| `esc` | Stops the turn: the reply being written, the command running, or the question about a tool, which counts as refused. What was written and done stays in the conversation. |
+| `y` / `n` | Allows or refuses the tool the screen asks about. |
 | `ctrl+q` | Quits. During the load of the model, the session closes as soon as the load ends. |
 
 A message that starts with a slash, with the command right after it, is a command: the session runs it and the model never receives it. While you type one the message box changes color and suggests the rest (`→` accepts). A slash followed by a space, or anywhere else in the message, is ordinary text.
@@ -155,7 +159,7 @@ A message that starts with a slash, with the command right after it, is a comman
 | `/think` | Tells how much the model in use thinks and the choices it has. |
 | `/think <choice>` | Chooses it: `on` or `off` for a local model, an effort from `none` to `max` for a model on OpenRouter. Each model keeps its choice during the session. |
 
-What the model thinks before it answers is shown above the reply, in a muted color. The status line shows how much of the model's context the conversation takes, as a share and in tokens.
+What the model thinks before it answers is shown above the reply, in a muted color. Each tool a reply asks for is shown under it: its name, what it acts on, the lines it would add (`+`) or remove (`-`), and, once it ran, a short summary of its result. The status line shows how much of the model's context the conversation takes, as a share and in tokens.
 
 ## Security
 
@@ -166,5 +170,6 @@ What the model thinks before it answers is shown above the reply, in a muted col
 - An API model is only used when no local model is configured or when you pick one with `/model`. From then on, the conversation, including the system prompt, is sent to OpenRouter, and only to providers that keep no data.
 - A system prompt with personal content belongs in a file that stays out of git.
 - Splitting across two machines is off by default, for the reason explained above.
-- The model only asks; the CLI is the one that executes. A tool that changes something (writing a file, running a command) asks for confirmation first.
-- Whatever the model reads from a file or from a command's output is data, not an instruction.
+- The model only asks; the CLI is the one that executes. Writing or editing a file and running a command always wait for `y`, and so does reading a file outside the folder the session started in.
+- A command runs with no input and with no terminal, so it never draws over the screen, and `esc` ends it together with everything it started.
+- What a tool returns can steer the model. With a local model, the chat marks of its format written in a file (such as `<|im_start|>`) reach the model as real marks, so a file can pose as a message of the user. Asking before every change is what keeps such a file from acting through the model: read what a call does before you answer `y`.

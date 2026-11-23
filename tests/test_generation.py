@@ -14,7 +14,7 @@ import pytest
 
 from agent_cli.inference.generation import LocalModel, context_tokens_of, open_local_client, open_local_model
 from agent_cli.inference.loader import LocalServer, load_model, record_of
-from agent_cli.inference.model import ContextFullError
+from agent_cli.inference.model import ContextFullError, ToolCall
 
 SERVER_ADDRESS = "http://127.0.0.1:8080"
 QUESTION = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Say hello."}]
@@ -120,6 +120,21 @@ def test_request_asks_for_the_thinking_the_count_and_the_progress(
         "timings_per_token": True,
         "return_progress": True,
     }
+
+
+def test_tool_call_is_read_as_llama_server_streams_it(server_process: subprocess.Popen, tmp_path: Path) -> None:
+    """The shape llama-server gives: no text, the id and the name with the first piece of the arguments, then pieces."""
+    first_part = {"index": 0, "id": "jfO9snGT", "type": "function", "function": {"name": "read_file", "arguments": "{"}}
+    pieces = ['"path":"', "notes", ".txt", '"', "}"]
+    chunks = [{"choices": [{"index": 0, "delta": {"role": "assistant", "content": None}, "finish_reason": None}]}]
+    chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [first_part]}, "finish_reason": None}]})
+    for piece in pieces:
+        part = {"index": 0, "function": {"arguments": piece}}
+        chunks.append({"choices": [{"index": 0, "delta": {"tool_calls": [part]}, "finish_reason": None}]})
+    chunks.append({"choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
+    model = model_reaching(FakeLlamaServer(lines_of(*chunks)).answer, server_process, tmp_path)
+    assert list(model.reply(QUESTION, [{"type": "function"}])) == []
+    assert model.tool_calls() == [ToolCall("jfO9snGT", "read_file", '{"path":"notes.txt"}')]
 
 
 def test_thinking_turned_off_goes_in_the_requests_that_follow(server_process: subprocess.Popen, tmp_path: Path) -> None:

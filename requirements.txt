@@ -1,7 +1,0 @@
-# agent-CLI dependencies. Python 3.12.
-# A local model also needs the llama-server program of llama.cpp on the PATH: see "Installation" in the README.
-
-textual==8.2.8  # draws the screen and reads the keyboard; the terminal application framework
-python-dotenv==1.2.4  # reads the .env file; the parser for the KEY=value format
-httpx==0.28.1  # talks to llama-server and to OpenRouter and reads the reply as it arrives; the HTTP client
-pytest==9.2.0  # runs the tests; the test runner

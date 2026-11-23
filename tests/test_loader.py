@@ -131,7 +131,7 @@ def test_missing_llama_server_says_what_to_install(tmp_path: Path, monkeypatch: 
 
 
 def test_command_serves_the_model_alone_with_every_layer_on_the_devices() -> None:
-    """One slot, every layer on the GPU, flash attention, the context fitted to the free memory, no web page."""
+    """One slot, every layer on the GPU, flash attention, the context fitted to the free memory, tools, no web page."""
     command = server_command("/bin/llama-server", Path("model.gguf"), (), 8080)
     assert command == [
         "/bin/llama-server",
@@ -146,6 +146,7 @@ def test_command_serves_the_model_alone_with_every_layer_on_the_devices() -> Non
         "--fit-ctx", "4096",
         "--batch-size", "512",
         "--cache-ram", "0",
+        "--jinja",
         "--log-timestamps",
         "--log-prefix",
         "--no-webui",

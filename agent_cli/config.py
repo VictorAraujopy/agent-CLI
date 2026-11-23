@@ -72,3 +72,11 @@ def load_settings() -> Settings:
     # variable in clear, the API key included, and neither a traceback that prints local values nor
     # anything that keeps the error may reach them.
     raise ValueError(message)
+
+
+def check_models_configured(settings: Settings) -> None:
+    """End the program when the settings give the session no model it can open."""
+    if settings.api_models and settings.api_key is None:
+        raise SystemExit("agent-CLI: API models are configured without a key. Set AGENT_CLI_API_KEY in the .env file.")
+    if settings.model_path is None and not settings.api_models:
+        raise SystemExit("agent-CLI: no model configured. Set AGENT_CLI_MODEL_PATH or AGENT_CLI_API_MODELS in .env.")

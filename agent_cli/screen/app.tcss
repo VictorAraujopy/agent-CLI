@@ -196,3 +196,33 @@ StatusLine {
 .-narrow #status-keys {
     width: 100%;
 }
+
+/* A tool a reply asked for: its name and what it acts on, the lines it changes, the question whether it may
+   run, and how it ended. */
+
+ToolView {
+    height: auto;
+    margin: 1 2 0 2;
+}
+
+.tool-preview {
+    margin: 0 0 0 2;
+}
+
+PermissionPrompt {
+    margin: 1 0 0 2;
+    color: $warning;
+}
+
+.tool-result {
+    margin: 0 0 0 2;
+    color: $text-muted;
+}
+
+.tool-result.failed {
+    color: $error;
+}
+
+.tool-result.denied {
+    color: $warning;
+}

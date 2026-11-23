@@ -1,9 +1,14 @@
 """The conversation: keeps the messages, cuts the oldest turns when the context fills, and runs each turn."""
 
-from collections.abc import Iterator
+import threading
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
-from agent_cli.inference.model import ContextFullError, Model
+from agent_cli.inference.model import ContextFullError, Message, Model, ToolCall
+from agent_cli.tools.tool import Ending, ToolResult
+from agent_cli.tools.toolbox import Toolbox, ToolUse
+
+NOT_RUN = ToolResult("Not run: the turn was stopped before this call.", "not run", Ending.NOT_RUN)
 
 
 class MessageTooLongError(Exception):
@@ -12,35 +17,85 @@ class MessageTooLongError(Exception):
 
 @dataclass
 class Turn:
-    """One exchange: the user's message and what answered it."""
+    """One exchange: the user's message, the model's replies and the results of the tools they asked for."""
 
-    messages: list[dict[str, str]]
+    messages: list[Message]
 
 
-def characters_in(messages: list[dict[str, str]]) -> int:
-    """Return how many characters of text the messages hold."""
-    return sum(len(message["content"]) for message in messages)
+@dataclass(frozen=True)
+class ToolStarted:
+    """A reply asked for a tool: the call as the user sees it, before it is allowed and run."""
+
+    use: ToolUse
+
+
+@dataclass(frozen=True)
+class ToolEnded:
+    """A tool call ended, run or not, with the result the model reads next."""
+
+    use: ToolUse
+    result: ToolResult
+
+
+def characters_in(messages: list[Message]) -> int:
+    """Return how many characters of text the messages hold, the arguments of their tool calls included."""
+    characters = 0
+    for message in messages:
+        characters += len(message["content"])
+        for call in message.get("tool_calls", []):
+            characters += len(call["function"]["arguments"])
+    return characters
+
+
+def reply_message(text: str, calls: list[ToolCall]) -> Message:
+    """Return the message of a model's reply, with the tools it asked for, in the chat completions format."""
+    message: Message = {"role": "assistant", "content": text}
+    if calls:
+        message["tool_calls"] = [
+            {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": call.arguments}}
+            for call in calls
+        ]
+    return message
+
+
+def tool_message(call_id: str, result_text: str) -> Message:
+    """Return the message that gives the model the result of one of its tool calls."""
+    return {"role": "tool", "tool_call_id": call_id, "content": result_text}
+
+
+def calls_with_no_result(messages: list[Message]) -> list[str]:
+    """Return the ids of the tool calls in the messages that no tool message answers, in order."""
+    answered = {message["tool_call_id"] for message in messages if message["role"] == "tool"}
+    asked: list[str] = []
+    for message in messages:
+        asked += [call["id"] for call in message.get("tool_calls", [])]
+    return [call_id for call_id in asked if call_id not in answered]
 
 
 class Conversation:
     """What is sent to the model: the system prompt first, then the turns that still fit in the context."""
 
-    def __init__(self, system_prompt: str) -> None:
-        """Start a conversation that holds only the system prompt, with no tokens counted yet."""
+    def __init__(self, system_prompt: str, toolbox: Toolbox) -> None:
+        """Start a conversation that holds only the system prompt, offers the tools, and has no tokens counted yet."""
         self.system_message = {"role": "system", "content": system_prompt}
+        self.toolbox = toolbox
         self.turns: list[Turn] = []
         # The tokens the model counted in its context when the last turn ended. After a cut it is an estimate,
         # until the next turn ends and the model counts again.
         self.tokens_in_context = 0
+        # Set by stop(): the turn being run asks the model for nothing more and runs no more tools.
+        self.stop_requested = threading.Event()
+        # Whether the last turn ended because the context filled, in the middle of a reply or between two.
+        self.turn_was_cut = False
 
-    def messages(self) -> list[dict[str, str]]:
+    def messages(self) -> list[Message]:
         """Return every message to send, in order: the system prompt, then the messages of each turn."""
         messages = [self.system_message]
         for turn in self.turns:
             messages.extend(turn.messages)
         return messages
 
-    def add_turn(self, messages: list[dict[str, str]], tokens_in_context_after_reply: int) -> None:
+    def add_turn(self, messages: list[Message], tokens_in_context_after_reply: int) -> None:
         """Keep a finished turn, and the tokens the model counted in its context when the turn ended."""
         self.turns.append(Turn(messages))
         self.tokens_in_context = tokens_in_context_after_reply
@@ -59,40 +114,79 @@ class Conversation:
             self.turns.pop(0)
             self.tokens_in_context = round(characters_in(self.messages()) * tokens_per_character)
 
-    def run_turn(self, model: Model, user_text: str) -> Iterator[str]:
-        """Send the user's message with the conversation, yield the reply piece by piece, and keep both."""
+    def stop(self) -> None:
+        """Ask the turn being run to end: no more tools run and the model is not asked again; safe from any thread."""
+        self.stop_requested.set()
+
+    def run_turn(
+        self, model: Model, user_text: str, ask_permission: Callable[[ToolUse], bool]
+    ) -> Iterator[str | ToolStarted | ToolEnded]:
+        """Send the user's message, yield each reply piece by piece and each tool it runs, and keep it all."""
+        self.stop_requested.clear()
+        self.turn_was_cut = False
         context_limit = model.context_limit()
         if self.is_full(context_limit):
             self.cut_oldest_turns(context_limit)
-        user_message = {"role": "user", "content": user_text}
+        turn_messages: list[Message] = [{"role": "user", "content": user_text}]
+        try:
+            yield from self.replies_and_tools(model, turn_messages, ask_permission)
+        except GeneratorExit:
+            # Whoever reads the turn closed it before the end: what was written and run so far stays.
+            self.keep_turn(model, turn_messages)
+            raise
+        self.keep_turn(model, turn_messages)
+
+    def replies_and_tools(
+        self, model: Model, turn_messages: list[Message], ask_permission: Callable[[ToolUse], bool]
+    ) -> Iterator[str | ToolStarted | ToolEnded]:
+        """Yield each reply and the tools it asks for, until a reply asks for none or the turn stops."""
+        while True:
+            try:
+                yield from self.next_reply(model, turn_messages)
+            except MessageTooLongError:
+                nothing_ran_yet = len(turn_messages) == 1
+                if nothing_ran_yet:
+                    raise
+                # Tools already ran, so the turn is kept, ended as a reply cut by the full context.
+                self.turn_was_cut = True
+                return
+            calls = model.tool_calls()
+            if not calls:
+                return
+            yield from self.run_tools(calls, turn_messages, ask_permission)
+            if self.stop_requested.is_set():
+                return
+
+    def next_reply(self, model: Model, turn_messages: list[Message]) -> Iterator[str]:
+        """Yield the model's next reply piece by piece, and keep it in the turn with the tools it asks for."""
         reply_pieces: list[str] = []
-        pieces = self.reply_that_fits(model, user_message)
+        pieces = self.reply_that_fits(model, turn_messages)
         try:
             for piece in pieces:
                 reply_pieces.append(piece)
                 yield piece
         except GeneratorExit:
-            # Whoever reads the reply closed it before the end. The model stops too, and what was shown stays.
+            # The model stops too, and what was shown stays.
             pieces.close()
-            self.keep_turn(model, user_message, reply_pieces)
+            turn_messages.append(reply_message("".join(reply_pieces), []))
             raise
-        self.keep_turn(model, user_message, reply_pieces)
+        turn_messages.append(reply_message("".join(reply_pieces), model.tool_calls()))
 
-    def reply_that_fits(self, model: Model, user_message: dict[str, str]) -> Iterator[str]:
-        """Yield the reply to the conversation and the new message, leaving the earlier turns out if they do not fit."""
+    def reply_that_fits(self, model: Model, turn_messages: list[Message]) -> Iterator[str]:
+        """Yield the reply to the conversation and the turn, leaving the earlier turns out if they do not fit."""
         try:
-            yield from model.reply(self.messages() + [user_message])
+            yield from model.reply(self.messages() + turn_messages, self.toolbox.schemas())
         except ContextFullError:
-            yield from self.reply_with_no_earlier_turns(model, user_message)
+            yield from self.reply_with_no_earlier_turns(model, turn_messages)
 
-    def reply_with_no_earlier_turns(self, model: Model, user_message: dict[str, str]) -> Iterator[str]:
-        """Yield the reply to the system prompt and the new message alone, dropping every earlier turn."""
+    def reply_with_no_earlier_turns(self, model: Model, turn_messages: list[Message]) -> Iterator[str]:
+        """Yield the reply to the system prompt and the turn alone, dropping every earlier turn."""
         earlier_turns = self.turns
         self.turns = []
         try:
-            yield from model.reply(self.messages() + [user_message])
+            yield from model.reply(self.messages() + turn_messages, self.toolbox.schemas())
         except ContextFullError as error:
-            # Not even the message alone fits. It is not sent, so the conversation goes back to how it was.
+            # Not even the turn alone fits. It is not sent, so the conversation goes back to how it was.
             self.turns = earlier_turns
             raise MessageTooLongError(str(error)) from error
         except Exception:
@@ -101,7 +195,30 @@ class Conversation:
             self.turns = earlier_turns
             raise
 
-    def keep_turn(self, model: Model, user_message: dict[str, str], reply_pieces: list[str]) -> None:
-        """Keep the user's message and the reply written to it, with the tokens the model holds now."""
-        reply_message = {"role": "assistant", "content": "".join(reply_pieces)}
-        self.add_turn([user_message, reply_message], model.tokens_in_use())
+    def run_tools(
+        self, calls: list[ToolCall], turn_messages: list[Message], ask_permission: Callable[[ToolUse], bool]
+    ) -> Iterator[ToolStarted | ToolEnded]:
+        """Run each call the user allows, yielding it before and after, and keep each result in the turn."""
+        for call in calls:
+            use = self.toolbox.read(call.name, call.arguments)
+            yield ToolStarted(use)
+            result = self.result_of(use, ask_permission)
+            turn_messages.append(tool_message(call.id, result.text))
+            yield ToolEnded(use, result)
+
+    def result_of(self, use: ToolUse, ask_permission: Callable[[ToolUse], bool]) -> ToolResult:
+        """Run the call if the turn goes on and the user allows it; a refusal stops the turn."""
+        if self.stop_requested.is_set():
+            return NOT_RUN
+        if use.asks_permission and not ask_permission(use):
+            self.stop_requested.set()
+            denial = "The user did not allow this call. Do not try it again: wait for the user's next message."
+            return ToolResult(denial, "denied", Ending.DENIED)
+        return self.toolbox.run(use, self.stop_requested)
+
+    def keep_turn(self, model: Model, turn_messages: list[Message]) -> None:
+        """Keep the messages of the turn, every tool call with a result, and the tokens the model holds now."""
+        for call_id in calls_with_no_result(turn_messages):
+            turn_messages.append(tool_message(call_id, NOT_RUN.text))
+        self.turn_was_cut = self.turn_was_cut or model.reply_was_cut()
+        self.add_turn(turn_messages, model.tokens_in_use())

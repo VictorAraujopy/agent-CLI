@@ -1,6 +1,7 @@
 """Tests for the screen: the model loaded in the background, the turn each message starts, and how a turn ends."""
 
 import asyncio
+import json
 import threading
 import time
 from collections.abc import Callable
@@ -15,11 +16,13 @@ from textual.widgets import Input, Static
 from agent_cli.agent.conversation import Conversation
 from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.generation import open_local_model
-from agent_cli.inference.model import Model
+from agent_cli.inference.model import Model, ToolCall
 from agent_cli.screen.app import Activity, AgentCliApp
 from agent_cli.screen.banner import Banner
-from agent_cli.screen.messages import Notice, Reply, Thinking, TurnView, thinking_and_answer_so_far
+from agent_cli.screen.messages import Notice, Reply, Thinking, ToolView, TurnView, thinking_and_answer_so_far
+from agent_cli.screen.permission import PermissionPrompt
 from agent_cli.screen.status import StatusLine
+from agent_cli.tools.toolbox import Toolbox
 from scripted_model import ScriptedModel
 
 SYSTEM_PROMPT = "Be brief."
@@ -27,9 +30,14 @@ MODEL_NAME = "test-model"
 SECONDS_TO_WAIT = 5
 
 
+def new_conversation() -> Conversation:
+    """Return a conversation for sessions that run no tool, so its toolbox points at no real folder."""
+    return Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")))
+
+
 def session_with(model: Model) -> AgentCliApp:
     """Return the screen of a session whose model opens at once."""
-    return AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: lambda: model}))
+    return AgentCliApp(new_conversation(), Catalog({MODEL_NAME: lambda: model}))
 
 
 def message_box(app: AgentCliApp) -> Input:
@@ -102,7 +110,7 @@ async def test_message_box_is_locked_while_the_model_loads() -> None:
         model_may_open.wait(SECONDS_TO_WAIT)
         return ScriptedModel(["ok"])
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: open_slowly}))
+    app = AgentCliApp(new_conversation(), Catalog({MODEL_NAME: open_slowly}))
     async with app.run_test() as pilot:
         await pilot.pause()
         assert message_box(app).disabled
@@ -134,7 +142,7 @@ async def test_model_that_fails_to_load_closes_the_screen_with_the_reason(capsys
         """Stand in for a load that fails, as it does when an RPC server is off."""
         raise ConnectionError("the server did not answer")
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: fail_to_open}))
+    app = AgentCliApp(new_conversation(), Catalog({MODEL_NAME: fail_to_open}))
     async with app.run_test() as pilot:
         await wait_until(lambda: app.return_code is not None, pilot)
     assert app.return_code == 1
@@ -151,7 +159,7 @@ async def test_quitting_while_the_model_loads_waits_for_the_load_to_end() -> Non
         model_may_open.wait(SECONDS_TO_WAIT)
         return ScriptedModel(["ok"])
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({MODEL_NAME: open_slowly}))
+    app = AgentCliApp(new_conversation(), Catalog({MODEL_NAME: open_slowly}))
     async with app.run_test() as pilot:
         await pilot.press("ctrl+q")
         await pilot.pause()
@@ -586,7 +594,7 @@ async def test_enter_pressed_twice_sends_the_message_once() -> None:
 def session_with_models(models: dict[str, Model]) -> AgentCliApp:
     """Return the screen of a session that can use the models given, by name, starting on the first."""
     how_to_open = {name: (lambda model=model: model) for name, model in models.items()}
-    return AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog(how_to_open))
+    return AgentCliApp(new_conversation(), Catalog(how_to_open))
 
 
 async def test_command_is_run_by_the_screen_and_never_reaches_the_model() -> None:
@@ -674,7 +682,7 @@ async def test_model_that_fails_to_open_in_a_switch_leaves_the_session_on_the_on
         """Stand in for a model that cannot be opened."""
         raise ConnectionError("the server did not answer")
 
-    app = AgentCliApp(Conversation(SYSTEM_PROMPT), Catalog({"first": lambda: first, "second": fail_to_open}))
+    app = AgentCliApp(new_conversation(), Catalog({"first": lambda: first, "second": fail_to_open}))
     async with app.run_test() as pilot:
         await wait_for_message_box(app, pilot)
         await send("/model second", app, pilot)
@@ -683,3 +691,153 @@ async def test_model_that_fails_to_open_in_a_switch_leaves_the_session_on_the_on
         await wait_for_message_box(app, pilot)
         assert app.catalog.model_in_use is first and not first.was_closed
         assert app.return_code is None
+
+
+def session_in(folder: Path, model: Model) -> AgentCliApp:
+    """Return the screen of a session whose model opens at once and whose tools act from the folder."""
+    return AgentCliApp(Conversation(SYSTEM_PROMPT, Toolbox(folder)), Catalog({MODEL_NAME: lambda: model}))
+
+
+def call(call_id: str, name: str, **arguments: object) -> ToolCall:
+    """Return a tool call as a model writes it, with its arguments as JSON."""
+    return ToolCall(call_id, name, json.dumps(arguments))
+
+
+def text_of(widget: Static) -> str:
+    """Return the text a widget shows."""
+    return str(widget.render())
+
+
+def tools_on_screen(app: AgentCliApp) -> list[ToolView]:
+    """Return the tools the conversation area shows, oldest first."""
+    return list(app.query(ToolView))
+
+
+def results_on_screen(app: AgentCliApp) -> list[str]:
+    """Return the text of how each tool shown ended, oldest first."""
+    return [text_of(result) for result in app.query(".tool-result").results(Static)]
+
+
+async def wait_for_the_question(app: AgentCliApp, pilot: Pilot) -> None:
+    """Let the screen run until it asks whether a tool may run."""
+    await wait_until(lambda: app.activity is Activity.WAITING_FOR_PERMISSION, pilot)
+
+
+async def test_tool_is_shown_under_the_reply_that_asked_and_the_next_reply_under_it(tmp_path: Path) -> None:
+    """The tool shows its name, what it acts on and how it ended, between the reply that asked and the next one."""
+    (tmp_path / "notes.txt").write_text("one\ntwo\n")
+    model = ScriptedModel(["Looking."], tool_calls_by_reply=[[call("c1", "read_file", path="notes.txt")]])
+    app = session_in(tmp_path, model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("read it", app, pilot)
+        await wait_for_message_box(app, pilot)
+        (turn,) = turns_on_screen(app)
+        kinds = [type(child).__name__ for child in turn.children]
+        assert kinds == ["UserMessage", "Thinking", "Reply", "ToolView", "Thinking", "Reply"]
+        (tool,) = tools_on_screen(app)
+        assert text_of(tool.children[0]) == "● read_file  notes.txt"
+        assert results_on_screen(app) == ["⎿ 2 lines"]
+        first_reply, last_reply = turn.query(Reply)
+        assert (first_reply.source, last_reply.source) == ("Looking.", "Looking.")
+        assert turn.reply is last_reply
+
+
+async def test_change_to_a_file_is_shown_and_asked_about_before_it_runs(tmp_path: Path) -> None:
+    """The lines that leave and come are shown, the box is locked, and esc and the keys to answer are told."""
+    (tmp_path / "notes.txt").write_text("Thsi line\n")
+    edit = call("c1", "edit_file", path="notes.txt", old_text="Thsi", new_text="This")
+    app = session_in(tmp_path, ScriptedModel(["Ok."], tool_calls_by_reply=[[edit]]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("fix it", app, pilot)
+        await wait_for_the_question(app, pilot)
+        (tool,) = tools_on_screen(app)
+        assert text_of(tool.query_one(".tool-preview", Static)) == "- Thsi\n+ This"
+        assert "y yes" in text_of(tool.query_one(PermissionPrompt))
+        assert app.focused is tool.query_one(PermissionPrompt)
+        assert message_box(app).disabled
+        assert message_box(app).placeholder == Activity.WAITING_FOR_PERMISSION.value
+        assert key_hints_on_screen(app).startswith("esc stop")
+        assert (tmp_path / "notes.txt").read_text() == "Thsi line\n"
+        await pilot.press("y")
+        await wait_for_message_box(app, pilot)
+        assert list(app.query(PermissionPrompt)) == []
+    assert (tmp_path / "notes.txt").read_text() == "This line\n"
+
+
+async def test_tool_refused_with_n_changes_nothing_and_ends_the_turn(tmp_path: Path) -> None:
+    """n refuses the tool: nothing changes, the tool shows it was denied, and the box is free again."""
+    write = call("c1", "write_file", path="new.txt", content="hi")
+    model = ScriptedModel(["Ok."], tool_calls_by_reply=[[write]])
+    app = session_in(tmp_path, model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("write it", app, pilot)
+        await wait_for_the_question(app, pilot)
+        await pilot.press("n")
+        await wait_for_message_box(app, pilot)
+        assert results_on_screen(app) == ["⎿ denied"]
+        assert list(app.query(PermissionPrompt)) == []
+    assert list(tmp_path.iterdir()) == []
+    assert len(model.conversations_received) == 1
+
+
+async def test_esc_while_a_tool_is_asked_about_refuses_it_and_stops_the_turn(tmp_path: Path) -> None:
+    """Esc takes the question off the screen, the tool does not run and the turn ends."""
+    write = call("c1", "write_file", path="new.txt", content="hi")
+    model = ScriptedModel(["Ok."], tool_calls_by_reply=[[write]])
+    app = session_in(tmp_path, model)
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("write it", app, pilot)
+        await wait_for_the_question(app, pilot)
+        await pilot.press("escape")
+        await wait_for_message_box(app, pilot)
+        assert list(app.query(PermissionPrompt)) == []
+        assert results_on_screen(app) == ["⎿ denied"]
+    assert list(tmp_path.iterdir()) == []
+    assert len(model.conversations_received) == 1
+
+
+async def test_closing_the_screen_while_a_tool_is_asked_about_lets_the_turn_end(tmp_path: Path) -> None:
+    """Quitting during the question refuses the tool, so the thread of the turn does not hold the program open."""
+    write = call("c1", "write_file", path="new.txt", content="hi")
+    app = session_in(tmp_path, ScriptedModel(["Ok."], tool_calls_by_reply=[[write]]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("write it", app, pilot)
+        await wait_for_the_question(app, pilot)
+        await pilot.press("ctrl+q")
+    give_up_at = time.monotonic() + SECONDS_TO_WAIT
+    while app.conversation.turns == [] and time.monotonic() < give_up_at:
+        time.sleep(0.01)
+    assert len(app.conversation.turns) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_command_that_fails_is_shown_in_the_color_of_a_failure(tmp_path: Path) -> None:
+    """A command allowed and run shows its exit code and last lines; a failed one is marked as failed."""
+    run = call("c1", "run_command", command="echo broken; exit 2")
+    app = session_in(tmp_path, ScriptedModel(["Ok."], tool_calls_by_reply=[[run]]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("run it", app, pilot)
+        await wait_for_the_question(app, pilot)
+        await pilot.press("y")
+        await wait_for_message_box(app, pilot)
+        (result,) = app.query(".tool-result").results(Static)
+        assert text_of(result) == "⎿ exit code 2\n  broken"
+        assert result.has_class("failed")
+
+
+async def test_turn_cut_by_the_result_of_a_tool_is_reported(tmp_path: Path) -> None:
+    """When what a tool returned fills the context, the turn ends as cut, though the reply itself was not."""
+    (tmp_path / "big.txt").write_text("x" * 500)
+    read_big = call("c1", "read_file", path="big.txt")
+    app = session_in(tmp_path, ScriptedModel(["Ok."], context_limit=100, tool_calls_by_reply=[[read_big]]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("read it", app, pilot)
+        await wait_for_message_box(app, pilot)
+        assert notices_on_screen(app) == ["reply cut: the model's context is full"]

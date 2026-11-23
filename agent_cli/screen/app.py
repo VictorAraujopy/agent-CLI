@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from functools import partial
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -11,14 +12,17 @@ from textual.message import Message
 from textual.suggester import SuggestFromList
 from textual.widgets import Input
 
-from agent_cli.agent.conversation import Conversation, MessageTooLongError
+from agent_cli.agent.conversation import Conversation, MessageTooLongError, ToolEnded, ToolStarted
 from agent_cli.commands import completions, is_command, run_command
 from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.model import Model
 from agent_cli.screen.banner import Banner
 from agent_cli.screen.messages import Notice, TurnView
+from agent_cli.screen.permission import PermissionAnswer, PermissionPrompt
 from agent_cli.screen.status import StatusLine
 from agent_cli.screen.theme import THEME_NAME, build_theme
+from agent_cli.tools.tool import ToolResult
+from agent_cli.tools.toolbox import ToolUse
 
 
 class Activity(Enum):
@@ -27,6 +31,7 @@ class Activity(Enum):
     LOADING_MODEL = "Loading the model…"
     WAITING_FOR_MESSAGE = "Type a message"
     GENERATING = "Generating…"
+    WAITING_FOR_PERMISSION = "Answer above: may the tool run?"
     CLOSING = "Closing as soon as the model is loaded…"
 
 
@@ -72,6 +77,27 @@ class AgentCliApp(App):
         context_limit: int
 
     @dataclass
+    class ToolAsked(Message):
+        """A reply of a turn asked for a tool, which is shown before it is allowed and run."""
+
+        turn: TurnView
+        use: ToolUse
+
+    @dataclass
+    class PermissionNeeded(Message):
+        """A tool of a turn may only run if the user allows it, and the thread of the turn waits for the answer."""
+
+        turn: TurnView
+        answer: PermissionAnswer
+
+    @dataclass
+    class ToolDone(Message):
+        """The tool shown last in a turn ended, run or not."""
+
+        turn: TurnView
+        result: ToolResult
+
+    @dataclass
     class MessageTooLong(Message):
         """The user's message of a turn does not fit in the model's context, so it was not sent."""
 
@@ -91,6 +117,8 @@ class AgentCliApp(App):
         self.catalog = catalog
         self.activity = Activity.LOADING_MODEL
         self.close_when_loaded = False
+        # The line that asks whether a tool may run, while the user has not answered it.
+        self.permission_prompt: PermissionPrompt | None = None
 
     def compose(self) -> ComposeResult:
         """Yield the conversation area with the banner, the message box and the status line."""
@@ -191,16 +219,31 @@ class AgentCliApp(App):
 
     @work(thread=True)
     def run_turn(self, model: Model, turn: TurnView, user_text: str) -> None:
-        """Run the turn in a background thread, telling the screen each piece of the reply and how it ended."""
+        """Run the turn in a background thread, telling the screen each piece, each tool and how the turn ended."""
+        ask_permission = partial(self.ask_permission, turn)
         try:
-            for piece in self.conversation.run_turn(model, user_text):
-                self.post_message(self.ReplyPiece(turn, piece))
+            for event in self.conversation.run_turn(model, user_text, ask_permission):
+                self.post_message(self.message_about(turn, event))
         except MessageTooLongError:
             self.post_message(self.MessageTooLong(turn))
         except Exception as error:
             self.post_message(self.ReplyFailed(turn, str(error)))
         else:
-            self.post_message(self.ReplyEnded(turn, model.reply_was_cut(), model.context_limit()))
+            self.post_message(self.ReplyEnded(turn, self.conversation.turn_was_cut, model.context_limit()))
+
+    def message_about(self, turn: TurnView, event: str | ToolStarted | ToolEnded) -> Message:
+        """Return the message that tells the screen what happened in the turn: a piece, a tool asked for or ended."""
+        if isinstance(event, ToolStarted):
+            return self.ToolAsked(turn, event.use)
+        if isinstance(event, ToolEnded):
+            return self.ToolDone(turn, event.result)
+        return self.ReplyPiece(turn, event)
+
+    def ask_permission(self, turn: TurnView, use: ToolUse) -> bool:
+        """Ask the user, from the thread of the turn, whether the tool may run, and wait for the answer."""
+        answer = PermissionAnswer()
+        self.post_message(self.PermissionNeeded(turn, answer))
+        return answer.wait(self.conversation.stop_requested)
 
     async def action_quit(self) -> None:
         """Close the screen, or leave that for when the model is loaded, if it is still loading."""
@@ -212,10 +255,14 @@ class AgentCliApp(App):
         self.exit()
 
     def action_stop_reply(self) -> None:
-        """Ask the model to end the reply it is writing; the turn then ends as usual, with what was written."""
+        """End the turn: the reply being written, the tool running and the question waiting; what was done stays."""
+        self.conversation.stop()
         model_in_use = self.catalog.model_in_use
         if model_in_use is not None:
             model_in_use.stop()
+        if self.permission_prompt is not None:
+            self.permission_prompt.remove()
+            self.permission_prompt = None
 
     @on(Unmount)
     def stop_reply_when_closing(self) -> None:
@@ -226,6 +273,37 @@ class AgentCliApp(App):
     async def show_piece(self, piece: ReplyPiece) -> None:
         """Add a piece of text to the end of the reply being written."""
         await piece.turn.add_piece(piece.text)
+
+    @on(ToolAsked)
+    async def show_tool(self, asked: ToolAsked) -> None:
+        """Show the tool a reply asked for, under that reply."""
+        await asked.turn.add_tool(asked.use)
+
+    @on(PermissionNeeded)
+    async def ask_about_tool(self, needed: PermissionNeeded) -> None:
+        """Ask under the tool whether it may run, and give the keyboard to the question."""
+        # A turn stopped before this message arrived has already taken the question as refused.
+        if self.conversation.stop_requested.is_set():
+            return
+        self.permission_prompt = PermissionPrompt(needed.answer)
+        await needed.turn.ask_permission(self.permission_prompt)
+        self.show_activity(Activity.WAITING_FOR_PERMISSION)
+        self.permission_prompt.focus()
+
+    @on(PermissionPrompt.Answered)
+    async def answer_about_tool(self, answered: PermissionPrompt.Answered) -> None:
+        """Give the thread of the turn the user's answer, and take the question off the screen."""
+        if answered.prompt is not self.permission_prompt:
+            return
+        answered.prompt.answer.give(answered.allowed)
+        self.permission_prompt = None
+        await answered.prompt.remove()
+        self.show_activity(Activity.GENERATING)
+
+    @on(ToolDone)
+    async def show_tool_result(self, done: ToolDone) -> None:
+        """Show how the tool shown last ended."""
+        await done.turn.show_tool_result(done.result)
 
     @on(ReplyEnded)
     async def finish_turn(self, ended: ReplyEnded) -> None:
@@ -276,4 +354,5 @@ class AgentCliApp(App):
         message_box.disabled = activity is not Activity.WAITING_FOR_MESSAGE
         if not message_box.disabled:
             message_box.focus()
-        self.query_one(StatusLine).reply_in_progress = activity is Activity.GENERATING
+        turn_in_progress = activity in (Activity.GENERATING, Activity.WAITING_FOR_PERMISSION)
+        self.query_one(StatusLine).reply_in_progress = turn_in_progress

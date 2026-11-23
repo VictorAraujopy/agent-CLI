@@ -178,6 +178,8 @@ def server_command(program: str, model_path: Path, rpc_servers: Sequence[str], p
         "--batch-size", "512",
         # The context already keeps what was read of the conversation; a copy in memory would only take room.
         "--cache-ram", "0",
+        # The chat template of the .gguf writes the tools and reads the calls back, the same way for every model.
+        "--jinja",
         # Every line of the log starts with its time and its level, E for an error: a failed load is told by them.
         "--log-timestamps",
         "--log-prefix",

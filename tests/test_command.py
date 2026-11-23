@@ -95,7 +95,100 @@ def test_command_that_takes_too_long_is_ended(tmp_path: Path, monkeypatch: pytes
     assert result.text == "stopped after 0.5 seconds\n"
 
 
-def test_running_a_command_always_asks(tmp_path: Path) -> None:
-    """A command can do anything the user can, so it always waits for the user to allow it."""
-    assert RunCommand(tmp_path).asks_permission({"command": "ls"})
+def asks(folder: Path, shell_command: str) -> bool:
+    """Tell whether run_command, from the folder, waits for the user before running the command."""
+    return RunCommand(folder).asks_permission({"command": shell_command})
+
+
+@pytest.mark.parametrize(
+    "shell_command",
+    [
+        "pwd",
+        "ls -la src",
+        "cat notes.txt",
+        "head -n 20 notes.txt | wc -l",
+        "grep -rn 'TODO; later' . | head -5",
+        "rg -n main --glob '*.py'",
+        "find . -name '*.py' -type f 2>/dev/null",
+        "tail -n 5 src/*.py",
+    ],
+)
+def test_command_that_only_reads_in_the_folder_runs_without_asking(tmp_path: Path, shell_command: str) -> None:
+    """Looking for and reading files in the working folder, alone or through a pipe, needs no answer."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print()\n")
+    assert not asks(tmp_path, shell_command)
+
+
+@pytest.mark.parametrize(
+    "shell_command",
+    [
+        "rm notes.txt",
+        "echo hi",
+        "ls; rm notes.txt",
+        "ls && rm notes.txt",
+        "ls || rm notes.txt",
+        "ls & rm notes.txt",
+        "ls > files.txt",
+        "cat notes.txt | sh",
+        "ls |",
+        "ls $(rm notes.txt)",
+        'grep "$(rm notes.txt)" .',
+        "ls `rm notes.txt`",
+        "ls\nrm notes.txt",
+        "ls notes#;rm notes.txt",
+        "cat 'notes.txt",
+        "find . -delete",
+        "find . -name '*.txt' -exec rm",
+        "rg --pre ./script main",
+        "rg --pre=./script main",
+        "rg --pre=script main",
+    ],
+)
+def test_command_that_can_change_something_or_run_a_program_asks(tmp_path: Path, shell_command: str) -> None:
+    """Any other command, a second command after an operator, a substitution or an option that runs a program ask."""
+    assert asks(tmp_path, shell_command)
+
+
+@pytest.mark.parametrize(
+    "shell_command",
+    [
+        "cat /etc/hosts",
+        "cat ../notes.txt",
+        "cat ~/.ssh/id_rsa",
+        "cat ~no-such-user-here/notes.txt",
+        "cat $HOME/.ssh/id_rsa",
+        "ls /",
+        "find .. -name '*.env'",
+        "cat {notes.txt,/etc/hosts}",
+        "grep --file=/etc/hosts word .",
+        "grep -R word .",
+        "grep -rS word .",
+        "grep --dereference word .",
+        "rg -L word",
+        "find -L . -name '*.txt'",
+    ],
+)
+def test_command_that_reads_out_of_the_folder_asks(tmp_path: Path, shell_command: str) -> None:
+    """A path out of the folder, or an option that follows links out of it, asks as a file out of it does."""
+    assert asks(tmp_path, shell_command)
+
+
+def test_link_out_of_the_folder_asks_when_named_or_matched_by_a_wildcard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A link inside the folder that points out of it asks, also when only a wildcard reaches it, after ~ too."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    folder = tmp_path / "project"
+    folder.mkdir()
+    (tmp_path / "secret.txt").write_text("key\n")
+    (folder / "notes.txt").symlink_to(tmp_path / "secret.txt")
+    assert asks(folder, "cat notes.txt")
+    assert asks(folder, "cat *")
+    assert asks(folder, "cat no?es.txt")
+    assert asks(folder, "cat ~/project/*")
+
+
+def test_summary_is_the_command(tmp_path: Path) -> None:
+    """The screen shows the command as the model wrote it."""
     assert RunCommand(tmp_path).summary({"command": "ls -la"}) == "ls -la"

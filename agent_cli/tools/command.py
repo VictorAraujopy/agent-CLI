@@ -1,15 +1,126 @@
 """The tool that runs a shell command in the working folder: run_command."""
 
+import glob
 import os
+import shlex
 import signal
 import subprocess
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
-from agent_cli.tools.tool import Ending, Tool, ToolResult
+from agent_cli.tools.tool import Ending, Tool, ToolError, ToolResult, path_in
 
 SECONDS_A_COMMAND_MAY_RUN = 120
+
+# The commands that only read, each with the options that would make it run a program, write a file or follow
+# links out of the folder.
+READING_COMMANDS = {
+    "pwd": (),
+    "ls": (),
+    "cat": (),
+    "head": (),
+    "tail": (),
+    "wc": (),
+    "grep": ("-R", "-S", "--dereference-recursive"),
+    "rg": ("-L", "--follow", "--pre", "--hostname-bin"),
+    "find": (
+        "-L", "-follow", "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"
+    ),
+}
+
+
+def words_of(command: str) -> list[str] | None:
+    """Split the command into words and operators as the shell does; None when its quotes are not closed."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    # The shell only takes # as a comment at the start of a word: kept as text, nothing after it is hidden.
+    lexer.commenters = ""
+    try:
+        return list(lexer)
+    except ValueError:
+        return None
+
+
+def without_redirects_to_nowhere(words: list[str]) -> list[str]:
+    """Return the words without each redirect to /dev/null, which only throws output away."""
+    kept: list[str] = []
+    for word in words:
+        if word == "/dev/null" and kept and kept[-1] in (">", ">>"):
+            kept.pop()
+            continue
+        kept.append(word)
+    return kept
+
+
+def is_operator(word: str) -> bool:
+    """Tell whether the word is an operator of the shell, such as ; or && or >: made only of their characters."""
+    return all(character in "();<>|&" for character in word)
+
+
+def commands_in_the_pipe(words: list[str]) -> list[list[str]]:
+    """Split the words at each pipe into the commands the pipe joins."""
+    commands: list[list[str]] = [[]]
+    for word in words:
+        if word == "|":
+            commands.append([])
+        else:
+            commands[-1].append(word)
+    return commands
+
+
+def turns_on(word: str, option: str) -> bool:
+    """Tell whether the word turns the option on: whole, abbreviated, with a value or among other one-letter options."""
+    if option.startswith("--"):
+        name = word.split("=")[0]
+        return len(name) > 2 and option.startswith(name)
+    if len(option) == 2:
+        return word.startswith("-") and not word.startswith("--") and option[1] in word[1:]
+    return word == option
+
+
+def stays_in_the_folder(word: str, working_folder: Path) -> bool:
+    """Tell whether the word, taken as a path, and each path its wildcards match, stay inside the working folder."""
+    written = os.path.expanduser(word)
+    # A link matched by a wildcard would take the command out of the folder with no path saying so.
+    paths = [written, *glob.glob(written, root_dir=working_folder)]
+    try:
+        return all(path_in(working_folder, path).is_relative_to(working_folder) for path in paths)
+    except ToolError:
+        return False
+
+
+def only_reads_in_the_folder(words: list[str], working_folder: Path) -> bool:
+    """Tell whether one command of the pipe is a reading command, with no option it forbids and no path outside."""
+    if not words or words[0] not in READING_COMMANDS:
+        return False
+    forbidden_options = READING_COMMANDS[words[0]]
+    for word in words[1:]:
+        if any(turns_on(word, option) for option in forbidden_options):
+            return False
+        is_option = word.startswith("-")
+        # The path in the value of an option is not looked at, so an option that holds one asks.
+        if is_option and "/" in word:
+            return False
+        if not is_option and not stays_in_the_folder(word, working_folder):
+            return False
+    return True
+
+
+def only_reads(command: str, working_folder: Path) -> bool:
+    """Tell whether the command only reads what is in the working folder, so it can run without asking."""
+    # $ and ` run a command even between double quotes, { } turn into paths no word shows, and a new line
+    # starts another command where the split sees a space.
+    if any(character in "$`{}\n\r" for character in command):
+        return False
+    words = words_of(command)
+    if words is None:
+        return False
+    words = without_redirects_to_nowhere(words)
+    if any(is_operator(word) and word != "|" for word in words):
+        return False
+    return all(only_reads_in_the_folder(each, working_folder) for each in commands_in_the_pipe(words))
 
 
 def start(command: str, working_folder: str) -> subprocess.Popen[str]:
@@ -70,7 +181,7 @@ def last_lines(output: str) -> list[str]:
 
 
 class RunCommand(Tool):
-    """Runs a shell command in the working folder, after the user allows it, and returns its exit code and output."""
+    """Runs a shell command in the working folder, asking first unless it only reads, and returns its output."""
 
     name = "run_command"
     description = (
@@ -88,8 +199,8 @@ class RunCommand(Tool):
         return arguments["command"]
 
     def asks_permission(self, arguments: dict[str, Any]) -> bool:
-        """Always ask: a command can do anything the user can."""
-        return True
+        """Ask unless the command only reads what is in the working folder: any other can do anything the user can."""
+        return not only_reads(arguments["command"], self.working_folder)
 
     def run(self, arguments: dict[str, Any], stop_requested: threading.Event) -> ToolResult:
         """Run the command and return its exit code and output, or why it was ended before it finished."""

@@ -221,6 +221,9 @@ class Conversation:
         """Run the call if the turn goes on and the user allows it; a refusal stops the turn."""
         if self.stop_requested.is_set():
             return NOT_RUN
+        # Check automode first - if approved, run without prompting
+        if self.toolbox.is_automode_approved(use.name, use.arguments):
+            return self.toolbox.run(use, self.stop_requested)
         if use.asks_permission and not ask_permission(use):
             self.stop_requested.set()
             denial = "The user did not allow this call. Do not try it again: wait for the user's next message."

@@ -81,9 +81,31 @@ def choose_thinking(option: str, catalog: Catalog) -> Outcome:
     return Outcome(f"thinking: {option}")
 
 
+def automode_choices(catalog: Catalog) -> list[str]:
+    """Return what /automode takes: clear, list, or status."""
+    return ["clear", "list"]
+
+
+def choose_automode(choice: str, catalog: Catalog) -> Outcome:
+    """Manage automode approvals for tool calls."""
+    # Note: This command handler needs access to the app's toolbox, which isn't available here
+    # In a full implementation, this would need to be handled differently
+    # For now, we'll return a message indicating this needs app context
+    if not choice:
+        return Outcome("Automode: Use /automode clear to clear approvals, /automode list to see current approvals")
+    
+    if choice == "clear":
+        return Outcome("Automode approvals cleared (requires app context to take effect)")
+    elif choice == "list":
+        return Outcome("Current automode approvals (requires app context to view)")
+    else:
+        return Outcome(f"Unknown automode option: {choice}. Use: clear, list", failed=True)
+
+
 COMMANDS = {
     "model": Command(run=choose_model, choices=model_choices),
     "think": Command(run=choose_thinking, choices=thinking_choices),
+    "automode": Command(run=choose_automode, choices=automode_choices),
 }
 
 

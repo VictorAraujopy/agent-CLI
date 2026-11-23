@@ -1,6 +1,7 @@
 """The tools a session offers the model, and how a call the model wrote is read, checked and run."""
 
 import json
+import hashlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -69,6 +70,8 @@ class Toolbox:
         """Make every tool act from the working folder, the one relative paths start at and commands run in."""
         tools = [ReadFile(working_folder), WriteFile(working_folder), EditFile(working_folder), RunCommand(working_folder)]
         self.tools = {tool.name: tool for tool in tools}
+        # Automode approvals: set of (tool_name, arguments_hash) for calls approved to run without re-prompting
+        self.automode_approvals: set[tuple[str, str]] = set()
 
     def schemas(self) -> list[dict[str, Any]]:
         """Return every tool as it is offered to the model."""
@@ -98,3 +101,25 @@ class Toolbox:
             return use.tool.run(use.arguments, stop_requested)
         except (ToolError, OSError) as error:
             return failure(str(error))
+
+    def _hash_arguments(self, arguments: dict[str, Any]) -> str:
+        """Create a consistent hash of tool arguments for automode tracking."""
+        return hashlib.sha256(json.dumps(arguments, sort_keys=True).encode()).hexdigest()
+
+    def is_automode_approved(self, tool_name: str, arguments: dict[str, Any]) -> bool:
+        """Check if this tool call has been approved for automode (run without re-prompting)."""
+        args_hash = self._hash_arguments(arguments)
+        return (tool_name, args_hash) in self.automode_approvals
+
+    def add_automode_approval(self, tool_name: str, arguments: dict[str, Any]) -> None:
+        """Mark this tool call as approved for automode so future identical calls won't prompt."""
+        args_hash = self._hash_arguments(arguments)
+        self.automode_approvals.add((tool_name, args_hash))
+
+    def clear_automode_approvals(self) -> None:
+        """Clear all automode approvals."""
+        self.automode_approvals.clear()
+
+    def list_automode_approvals(self) -> list[tuple[str, str]]:
+        """List all current automode approvals."""
+        return list(self.automode_approvals)

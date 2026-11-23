@@ -324,6 +324,9 @@ class AgentCliApp(App):
     def stop_reply_when_closing(self) -> None:
         """Stop the reply when the app closes, so one still being written does not hold the terminal."""
         self.action_stop_reply()
+        # Clear automode approvals when the session ends
+        if self.toolbox is not None:
+            self.toolbox.clear_automode_approvals()
 
     @on(ReplyPiece)
     async def show_piece(self, piece: ReplyPiece) -> None:
@@ -355,6 +358,13 @@ class AgentCliApp(App):
         self.permission_prompt = None
         await answered.prompt.remove()
         self.show_activity(Activity.GENERATING)
+        # If the user chose 'always' (automode), store the approval
+        if answered.always and self.current_tool_use is not None:
+            self.toolbox.add_automode_approval(
+                self.current_tool_use.tool.name,
+                self.current_tool_use.arguments
+            )
+            await self.show_notice(f"tool {self.current_tool_use.name} approved for automode this session", tone="muted")
 
     @on(ToolDone)
     async def show_tool_result(self, done: ToolDone) -> None:

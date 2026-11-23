@@ -1,4 +1,4 @@
-"""The tool that runs a shell command in the working folder: run_command."""
+"""The tool that runs a shell command in the working folder, run_command, and how it tells a command that only reads."""
 
 import glob
 import os
@@ -7,15 +7,16 @@ import signal
 import subprocess
 import threading
 import time
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any
 
-from agent_cli.tools.tool import Ending, Tool, ToolError, ToolResult, path_in
+from agent_cli.tools.tool import Ending, Tool, ToolError, ToolResult, is_secret, path_in
 
 SECONDS_A_COMMAND_MAY_RUN = 120
 
-# The commands that only read, each with the options that would make it run a program, write a file or follow
-# links out of the folder.
+# The commands that only read, each with the options that would make it run a program, write a file, or follow
+# links inside the folders it searches, where the look for secrets does not go.
 READING_COMMANDS = {
     "pwd": (),
     "ls": (),
@@ -23,12 +24,22 @@ READING_COMMANDS = {
     "head": (),
     "tail": (),
     "wc": (),
+    "du": (),
+    "mdfind": (),
     "grep": ("-R", "-S", "--dereference-recursive"),
     "rg": ("-L", "--follow", "--pre", "--hostname-bin"),
-    "find": (
-        "-L", "-follow", "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"
-    ),
+    "find": ("-exec", "-execdir", "-ok", "-okdir", "-delete", "-fls", "-fprint", "-fprint0", "-fprintf"),
 }
+
+# A search inside files looks through its folders for a secret first; a folder with more entries than this asks.
+ENTRIES_A_SEARCH_MAY_LOOK_THROUGH = 20_000
+
+# The operators that only join commands: with each command checked on its own, they read no more than one would.
+COMMAND_SEPARATORS = ("|", "&&", "||", ";")
+
+# A lone parenthesis groups the tests of find, as in \( -name a -o -name b \). Where it runs something, a subshell at
+# the start of a command or a function right after its name, reads_no_secret refuses the command.
+GROUPING_PARENTHESES = ("(", ")")
 
 
 def words_of(command: str) -> list[str] | None:
@@ -43,11 +54,15 @@ def words_of(command: str) -> list[str] | None:
         return None
 
 
-def without_redirects_to_nowhere(words: list[str]) -> list[str]:
-    """Return the words without each redirect to /dev/null, which only throws output away."""
+def without_harmless_redirects(words: list[str]) -> list[str]:
+    """Return the words without the redirects that write no file: to /dev/null, or into another output, as 2>&1."""
     kept: list[str] = []
     for word in words:
-        if word == "/dev/null" and kept and kept[-1] in (">", ">>"):
+        previous = kept[-1] if kept else ""
+        to_nowhere = word == "/dev/null" and previous in (">", ">>", "&>", "&>>")
+        # >& followed by a name, not a number, writes both outputs to that file.
+        into_another_output = word.isdigit() and previous == ">&"
+        if to_nowhere or into_another_output:
             kept.pop()
             continue
         kept.append(word)
@@ -59,11 +74,11 @@ def is_operator(word: str) -> bool:
     return all(character in "();<>|&" for character in word)
 
 
-def commands_in_the_pipe(words: list[str]) -> list[list[str]]:
-    """Split the words at each pipe into the commands the pipe joins."""
+def commands_in(words: list[str]) -> list[list[str]]:
+    """Split the words into the commands that |, &&, || and ; join."""
     commands: list[list[str]] = [[]]
     for word in words:
-        if word == "|":
+        if word in COMMAND_SEPARATORS:
             commands.append([])
         else:
             commands[-1].append(word)
@@ -80,36 +95,90 @@ def turns_on(word: str, option: str) -> bool:
     return word == option
 
 
-def stays_in_the_folder(word: str, working_folder: Path) -> bool:
-    """Tell whether the word, taken as a path, and each path its wildcards match, stay inside the working folder."""
-    written = os.path.expanduser(word)
-    # A link matched by a wildcard would take the command out of the folder with no path saying so.
-    paths = [written, *glob.glob(written, root_dir=working_folder)]
+def value_of(option: str) -> str:
+    """Return what an option holds: what follows its =, or the letters after a short one, as in -f.env."""
+    if "=" in option:
+        return option.split("=", 1)[1]
+    if option.startswith("--"):
+        return ""
+    return option[2:]
+
+
+def reaches_no_secret(path_written: str, working_folder: Path) -> bool:
+    """Tell whether the path, and each path its wildcards match, stay out of the secret places, links followed."""
+    expanded = os.path.expanduser(path_written)
+    # A wildcard can match a secret, or a link to one, with no path written saying so.
+    paths = [expanded, *glob.glob(expanded, root_dir=working_folder)]
     try:
-        return all(path_in(working_folder, path).is_relative_to(working_folder) for path in paths)
+        return not any(is_secret(path_in(working_folder, path)) for path in paths)
     except ToolError:
         return False
 
 
-def only_reads_in_the_folder(words: list[str], working_folder: Path) -> bool:
-    """Tell whether one command of the pipe is a reading command, with no option it forbids and no path outside."""
+def searches_inside_files(words: list[str]) -> bool:
+    """Tell whether the command reads every file under the folders it names: rg always, grep when recursive."""
+    if words[0] == "rg":
+        return True
+    recursive_options = ("-r", "--recursive", "-d", "--directories")
+    return words[0] == "grep" and any(turns_on(word, option) for word in words[1:] for option in recursive_options)
+
+
+def paths_searched(words: list[str], working_folder: Path) -> list[Path]:
+    """Return the paths a recursive search goes through: those named after its pattern, or else the working folder."""
+    loose_words = [word for word in words[1:] if not word.startswith("-")]
+    # The first loose word is taken as the pattern, also after -e: grep -r src and grep -r -e src search here.
+    named_paths = loose_words[1:]
+    resolved = [path_in(working_folder, os.path.expanduser(word)) for word in named_paths]
+    return [path for path in resolved if path.exists()] or [working_folder]
+
+
+def included_names(words: list[str]) -> list[str]:
+    """Return the name patterns grep --include=... limits its search to; with none it reads every file."""
+    if words[0] != "grep":
+        return []
+    return [value_of(word) for word in words[1:] if turns_on(word, "--include") and "=" in word]
+
+
+def is_read(name: str, name_patterns: list[str]) -> bool:
+    """Tell whether a recursive search reads the file of that name: every file, or only those its patterns match."""
+    return not name_patterns or any(fnmatchcase(name, pattern) for pattern in name_patterns)
+
+
+def may_hold_a_secret(path: Path, name_patterns: list[str]) -> bool:
+    """Tell whether a secret file the search reads is under the path, or there are too many entries to look through."""
+    entries_seen = 0
+    for current, folder_names, file_names in os.walk(path):
+        names_read = [name for name in file_names if is_read(name, name_patterns)]
+        if any(is_secret(Path(current) / name) for name in names_read):
+            return True
+        entries_seen += len(folder_names) + len(file_names)
+        if entries_seen > ENTRIES_A_SEARCH_MAY_LOOK_THROUGH:
+            return True
+    return False
+
+
+def reads_no_secret(words: list[str], working_folder: Path) -> bool:
+    """Tell whether one command of the line is a reading command, with no option it forbids, that reaches no secret."""
     if not words or words[0] not in READING_COMMANDS:
+        return False
+    # Right after the name, a parenthesis defines a function with that name, which a later command would run.
+    if words[1:2] == ["("]:
         return False
     forbidden_options = READING_COMMANDS[words[0]]
     for word in words[1:]:
         if any(turns_on(word, option) for option in forbidden_options):
             return False
-        is_option = word.startswith("-")
-        # The path in the value of an option is not looked at, so an option that holds one asks.
-        if is_option and "/" in word:
+        path_written = value_of(word) if word.startswith("-") else word
+        if path_written and not reaches_no_secret(path_written, working_folder):
             return False
-        if not is_option and not stays_in_the_folder(word, working_folder):
-            return False
+    if searches_inside_files(words):
+        name_patterns = included_names(words)
+        return not any(may_hold_a_secret(path, name_patterns) for path in paths_searched(words, working_folder))
     return True
 
 
 def only_reads(command: str, working_folder: Path) -> bool:
-    """Tell whether the command only reads what is in the working folder, so it can run without asking."""
+    """Tell whether the command only reads, and nothing secret, so it can run without asking."""
     # $ and ` run a command even between double quotes, { } turn into paths no word shows, and a new line
     # starts another command where the split sees a space.
     if any(character in "$`{}\n\r" for character in command):
@@ -117,10 +186,10 @@ def only_reads(command: str, working_folder: Path) -> bool:
     words = words_of(command)
     if words is None:
         return False
-    words = without_redirects_to_nowhere(words)
-    if any(is_operator(word) and word != "|" for word in words):
+    words = without_harmless_redirects(words)
+    if any(is_operator(word) and word not in COMMAND_SEPARATORS + GROUPING_PARENTHESES for word in words):
         return False
-    return all(only_reads_in_the_folder(each, working_folder) for each in commands_in_the_pipe(words))
+    return all(reads_no_secret(each, working_folder) for each in commands_in(words))
 
 
 def start(command: str, working_folder: str) -> subprocess.Popen[str]:
@@ -199,7 +268,7 @@ class RunCommand(Tool):
         return arguments["command"]
 
     def asks_permission(self, arguments: dict[str, Any]) -> bool:
-        """Ask unless the command only reads what is in the working folder: any other can do anything the user can."""
+        """Ask unless the command only reads, and nothing secret: any other can do anything the user can."""
         return not only_reads(arguments["command"], self.working_folder)
 
     def run(self, arguments: dict[str, Any], stop_requested: threading.Event) -> ToolResult:

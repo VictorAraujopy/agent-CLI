@@ -1,4 +1,4 @@
-"""Tests for run_command: where the command runs, what it returns, and how it is ended early."""
+"""Tests for run_command: where the command runs, what it returns, how it is ended early, and when it asks."""
 
 import os
 import threading
@@ -107,14 +107,30 @@ def asks(folder: Path, shell_command: str) -> bool:
         "ls -la src",
         "cat notes.txt",
         "head -n 20 notes.txt | wc -l",
+        "du -sh src",
+        "pwd && ls -la",
+        "ls src; cat notes.txt",
+        "cat notes.txt || ls",
         "grep -rn 'TODO; later' . | head -5",
         "rg -n main --glob '*.py'",
         "find . -name '*.py' -type f 2>/dev/null",
+        "find . -name '*.py' &>/dev/null",
+        "ls -la src 2>&1",
+        "find . -maxdepth 2 \\( -name '*.pdf' -o -name '*.docx' \\) -type f",
+        'grep -rn "def main(" .',
         "tail -n 5 src/*.py",
+        "cat /etc/hosts",
+        "cat ../notes.txt",
+        "ls /",
+        "find / -type f \\( -iname '*cv*' -o -iname '*resume*' \\) 2>/dev/null",
+        "find -L ~ -name '*.pdf'",
+        "mdfind -name cv",
+        "du -sh ..",
+        "grep --file=/etc/hosts word notes.txt",
     ],
 )
-def test_command_that_only_reads_in_the_folder_runs_without_asking(tmp_path: Path, shell_command: str) -> None:
-    """Looking for and reading files in the working folder, alone or through a pipe, needs no answer."""
+def test_command_that_only_reads_runs_without_asking(tmp_path: Path, shell_command: str) -> None:
+    """Looking for and reading files, in the folder or anywhere else, alone or joined to others, needs no answer."""
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "main.py").write_text("print()\n")
     assert not asks(tmp_path, shell_command)
@@ -130,8 +146,17 @@ def test_command_that_only_reads_in_the_folder_runs_without_asking(tmp_path: Pat
         "ls || rm notes.txt",
         "ls & rm notes.txt",
         "ls > files.txt",
+        "ls >&files.txt",
+        "ls 2>&1 > files.txt",
         "cat notes.txt | sh",
         "ls |",
+        "ls &&",
+        "ls ;; cat notes.txt",
+        "(rm notes.txt)",
+        "ls && (rm notes.txt)",
+        "ls ( ) ( rm notes.txt ) ; ls",
+        "ls () ( rm notes.txt ) ; ls",
+        "find . -name '*.py' -exec grep -l Catalog {} \\;",
         "ls $(rm notes.txt)",
         'grep "$(rm notes.txt)" .',
         "ls `rm notes.txt`",
@@ -153,40 +178,88 @@ def test_command_that_can_change_something_or_run_a_program_asks(tmp_path: Path,
 @pytest.mark.parametrize(
     "shell_command",
     [
-        "cat /etc/hosts",
-        "cat ../notes.txt",
         "cat ~/.ssh/id_rsa",
+        "ls ~/.ssh",
+        "cat .env",
+        "head config/.env.local",
+        "cat ~/.aws/credentials",
+        "cat ~/.netrc",
+        "cat ~/.gnupg/pubring.kbx",
+        "cat ~/.agent-cli/history.db",
+        "grep KEY .env",
+        "find . -name .env",
+        "grep --file=~/.ssh/id_rsa word notes.txt",
+        "grep -f.env word notes.txt",
         "cat ~no-such-user-here/notes.txt",
         "cat $HOME/.ssh/id_rsa",
-        "ls /",
-        "find .. -name '*.env'",
-        "cat {notes.txt,/etc/hosts}",
-        "grep --file=/etc/hosts word .",
+        "cat {notes.txt,.env}",
         "grep -R word .",
         "grep -rS word .",
         "grep --dereference word .",
         "rg -L word",
-        "find -L . -name '*.txt'",
     ],
 )
-def test_command_that_reads_out_of_the_folder_asks(tmp_path: Path, shell_command: str) -> None:
-    """A path out of the folder, or an option that follows links out of it, asks as a file out of it does."""
+def test_command_that_reads_a_secret_or_follows_links_asks(tmp_path: Path, shell_command: str) -> None:
+    """A key, a .env or another secret place asks, and so do the options that follow links where no check looks."""
     assert asks(tmp_path, shell_command)
 
 
-def test_link_out_of_the_folder_asks_when_named_or_matched_by_a_wildcard(
+def test_link_to_a_secret_asks_when_named_or_matched_by_a_wildcard(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A link inside the folder that points out of it asks, also when only a wildcard reaches it, after ~ too."""
+    """A link to a secret asks, also when only a wildcard reaches it, after ~ too; a link to anything else reads."""
     monkeypatch.setenv("HOME", str(tmp_path))
     folder = tmp_path / "project"
     folder.mkdir()
-    (tmp_path / "secret.txt").write_text("key\n")
-    (folder / "notes.txt").symlink_to(tmp_path / "secret.txt")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "id_rsa").write_text("key\n")
+    (folder / "notes.txt").symlink_to(tmp_path / ".ssh" / "id_rsa")
     assert asks(folder, "cat notes.txt")
     assert asks(folder, "cat *")
     assert asks(folder, "cat no?es.txt")
     assert asks(folder, "cat ~/project/*")
+    (folder / "notes.txt").unlink()
+    (tmp_path / "plain.txt").write_text("hi\n")
+    (folder / "notes.txt").symlink_to(tmp_path / "plain.txt")
+    assert not asks(folder, "cat *")
+
+
+def test_search_inside_the_files_of_a_folder_with_a_secret_asks(tmp_path: Path) -> None:
+    """grep -r and rg read every file under a folder: one that holds a secret, at any depth, asks."""
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / ".env").write_text("KEY=1\n")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("print()\n")
+    assert asks(tmp_path, "grep -rn KEY .")
+    assert asks(tmp_path, "grep -r KEY")
+    assert asks(tmp_path, "grep --recursive KEY .")
+    assert asks(tmp_path, "grep -d recurse KEY .")
+    assert asks(tmp_path, "rg KEY")
+    assert asks(tmp_path, "grep -rn KEY src config")
+    assert asks(tmp_path, "grep -r src")
+    assert asks(tmp_path, "grep -r -e src")
+    assert not asks(tmp_path, "grep -rn KEY src")
+    assert not asks(tmp_path, "grep -r -i --include='*.py' KEY .")
+    assert asks(tmp_path, "grep -r --include='*.py' --include='.env*' KEY .")
+    assert asks(tmp_path, "rg --include='*.py' KEY")
+    assert asks(tmp_path, "grep -r --include '*.py' KEY .")
+    assert not asks(tmp_path, "grep -rn -e KEY src")
+    assert not asks(tmp_path, "rg KEY src")
+    assert not asks(tmp_path, "grep KEY src/main.py")
+    assert not asks(tmp_path, "grep -rn KEY src/main.py")
+
+
+def test_search_inside_a_folder_too_big_to_look_through_asks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A folder with more entries than the look for secrets goes through asks, since a secret could be past them."""
+    monkeypatch.setattr(command, "ENTRIES_A_SEARCH_MAY_LOOK_THROUGH", 2)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (tmp_path / name).write_text("text\n")
+    assert asks(tmp_path, "grep -rn text .")
+    monkeypatch.setattr(command, "ENTRIES_A_SEARCH_MAY_LOOK_THROUGH", 3)
+    assert not asks(tmp_path, "grep -rn text .")
+    for name in ("d", "e", "f", "g"):
+        (tmp_path / "folders" / name).mkdir(parents=True)
+    assert asks(tmp_path, "grep -rn text folders")
 
 
 def test_summary_is_the_command(tmp_path: Path) -> None:

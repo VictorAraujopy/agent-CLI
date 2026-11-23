@@ -39,6 +39,18 @@ def path_in(working_folder: Path, path_written: str) -> Path:
         raise ToolError(f"{path_written!r} is not a path that can be used: {error}") from None
 
 
+# The places that hold keys and passwords. Reading in one asks first; anywhere else a reading tool runs at once.
+SECRET_FOLDERS = (".ssh", ".gnupg", ".aws", ".agent-cli")
+SECRET_FILES = (".env", ".netrc")
+
+
+def is_secret(path: Path) -> bool:
+    """Tell whether the path is in a folder of keys, such as .ssh, or is a file of secrets, such as .env.local."""
+    in_a_secret_folder = any(part in SECRET_FOLDERS for part in path.parts)
+    named_as_secret = path.name in SECRET_FILES or path.name.startswith(".env.")
+    return in_a_secret_folder or named_as_secret
+
+
 def lines_in(text: str) -> str:
     """Return how many lines the text has, in words."""
     count = len(text.splitlines())

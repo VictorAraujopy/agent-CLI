@@ -95,17 +95,24 @@ def test_file_that_is_not_text_is_not_read(tmp_path: Path) -> None:
         read(tmp_path, "image.png")
 
 
-def test_reading_asks_only_for_a_file_outside_the_working_folder(tmp_path: Path) -> None:
-    """Inside the working folder no question; outside it, by its path, by .. or through a link, the user is asked."""
+def test_reading_asks_only_for_a_secret_wherever_it_is(tmp_path: Path) -> None:
+    """Any file reads at once, in the folder or out of it; a key or a .env asks, also when a link reaches it."""
     working_folder = tmp_path / "project"
     working_folder.mkdir()
-    (working_folder / "link-out").symlink_to(tmp_path)
+    (tmp_path / ".ssh").mkdir()
+    (working_folder / "keys").symlink_to(tmp_path / ".ssh")
     tool = ReadFile(working_folder)
     assert not tool.asks_permission({"path": "notes.txt"})
-    assert not tool.asks_permission({"path": str(working_folder / "folder" / "notes.txt")})
-    assert tool.asks_permission({"path": "/etc/hosts"})
-    assert tool.asks_permission({"path": "../secret.txt"})
-    assert tool.asks_permission({"path": "link-out/secret.txt"})
+    assert not tool.asks_permission({"path": "/etc/hosts"})
+    assert not tool.asks_permission({"path": "../notes.txt"})
+    assert tool.asks_permission({"path": "~/.ssh/id_ed25519"})
+    assert tool.asks_permission({"path": "keys/id_ed25519"})
+    assert tool.asks_permission({"path": ".env"})
+    assert tool.asks_permission({"path": "config/.env.local"})
+    assert tool.asks_permission({"path": "~/.netrc"})
+    assert tool.asks_permission({"path": "~/.aws/credentials"})
+    assert tool.asks_permission({"path": "~/.gnupg/private-keys-v1.d/key"})
+    assert tool.asks_permission({"path": "~/.agent-cli/history.db"})
 
 
 def test_write_creates_the_file_and_the_folders_on_its_way(tmp_path: Path) -> None:

@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from agent_cli.tools.tool import Tool, ToolError, ToolResult, lines_in, path_in
+from agent_cli.tools.tool import Tool, ToolError, ToolResult, is_secret, lines_in, path_in
 
 PATH_PARAMETER = {"type": "string", "description": "The file, relative to the working folder or absolute."}
 
@@ -47,7 +47,7 @@ def marked_lines(mark: str, text: str) -> list[str]:
 
 
 class ReadFile(Tool):
-    """Reads a text file, in parts when it is long; it asks first only for a file outside the working folder."""
+    """Reads a text file, in parts when it is long; it asks first only for a secret, such as a .env file."""
 
     name = "read_file"
     description = (
@@ -67,9 +67,8 @@ class ReadFile(Tool):
         return arguments["path"]
 
     def asks_permission(self, arguments: dict[str, Any]) -> bool:
-        """Ask only for a file outside the working folder, which may hold what the user never meant to share."""
-        path = path_in(self.working_folder, arguments["path"])
-        return not path.is_relative_to(self.working_folder)
+        """Ask only for a secret, such as a key in .ssh or a .env file, even when a link is what reaches it."""
+        return is_secret(path_in(self.working_folder, arguments["path"]))
 
     def run(self, arguments: dict[str, Any], stop_requested: threading.Event) -> ToolResult:
         """Return the part of the file that starts at the line asked, and how to read on when there is more."""

@@ -84,10 +84,12 @@ class ApiModel(ChatCompletionsModel):
         self.thinking_effort = "max"
 
     def fields_of_this_server(self) -> dict[str, Any]:
-        """Return what OpenRouter needs besides the conversation: the model, no data kept, and the thinking effort."""
+        """Return what OpenRouter needs besides the conversation: the model, the providers and the thinking effort."""
+        # A provider slower than 40 tokens a second in more than 1 of 10 requests of the last 5 minutes goes last.
+        fast_providers_first = {"p90": 40}
         return {
             "model": self.model_name,
-            "provider": {"zdr": True, "data_collection": "deny"},
+            "provider": {"zdr": True, "data_collection": "deny", "preferred_min_throughput": fast_providers_first},
             "reasoning": {"effort": self.thinking_effort},
         }
 

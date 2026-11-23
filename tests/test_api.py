@@ -140,7 +140,7 @@ def test_reply_is_the_text_of_each_chunk_in_order() -> None:
 
 
 def test_request_carries_the_conversation_the_model_and_the_rules_of_every_request() -> None:
-    """One streamed request goes to the chat completions, restricted to providers that keep no data, thinking on."""
+    """One streamed request goes to the chat completions, to fast providers that keep no data, thinking on."""
     openrouter = FakeOpenRouter(lines_of_a_short_reply())
     list(openrouter.model().reply(QUESTION))
     [request] = openrouter.requests
@@ -150,7 +150,7 @@ def test_request_carries_the_conversation_the_model_and_the_rules_of_every_reque
         "model": "author/model",
         "messages": QUESTION,
         "stream": True,
-        "provider": {"zdr": True, "data_collection": "deny"},
+        "provider": {"zdr": True, "data_collection": "deny", "preferred_min_throughput": {"p90": 40}},
         "reasoning": {"effort": "max"},
     }
 

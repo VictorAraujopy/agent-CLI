@@ -1,8 +1,10 @@
 """The screen: the Textual app that reads what the user types and shows what arrives."""
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
+from functools import partial, wraps
+from typing import Any
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -36,6 +38,19 @@ class Activity(Enum):
     WAITING_FOR_PERMISSION = "Answer above: may the tool run?"
     CLOSING = "Closing as soon as the model is loaded…"
     CLOSING_AFTER_THE_TURN = "Closing as soon as the turn is saved…   ctrl+q closes now"
+
+
+def only_while_running(handler: Callable[[Any, Any], Awaitable[None]]) -> Callable[[Any, Any], Awaitable[None]]:
+    """Make a handler of what a background thread tells the screen do nothing once the app is closing."""
+
+    # Textual stops running, takes the screen away and only then handles the messages still waiting, so a
+    # message a thread posted just before the close would look for widgets that are gone.
+    @wraps(handler)
+    async def handle_while_running(app: "AgentCliApp", message: Any) -> None:
+        if app.is_running:
+            await handler(app, message)
+
+    return handle_while_running
 
 
 class AgentCliApp(App):
@@ -209,6 +224,7 @@ class AgentCliApp(App):
         self.post_message(self.ModelLoaded(name, model.context_limit()))
 
     @on(ModelLoaded)
+    @only_while_running
     async def use_model(self, loaded: ModelLoaded) -> None:
         """Show the name and the context of the model that was opened and unlock the box, or close if asked."""
         if self.close_when_loaded:
@@ -225,6 +241,7 @@ class AgentCliApp(App):
         self.show_activity(Activity.WAITING_FOR_MESSAGE)
 
     @on(ModelFailedToLoad)
+    @only_while_running
     async def report_model_not_opened(self, failed: ModelFailedToLoad) -> None:
         """Say why the model did not open and stay on the one in use; with none in use, close with the reason."""
         if self.catalog.model_in_use is None:
@@ -326,16 +343,19 @@ class AgentCliApp(App):
         self.action_stop_reply()
 
     @on(ReplyPiece)
+    @only_while_running
     async def show_piece(self, piece: ReplyPiece) -> None:
         """Add a piece of text to the end of the reply being written."""
         await piece.turn.add_piece(piece.text)
 
     @on(ToolAsked)
+    @only_while_running
     async def show_tool(self, asked: ToolAsked) -> None:
         """Show the tool a reply asked for, under that reply."""
         await asked.turn.add_tool(asked.use)
 
     @on(PermissionNeeded)
+    @only_while_running
     async def ask_about_tool(self, needed: PermissionNeeded) -> None:
         """Ask under the tool whether it may run, and give the keyboard to the question."""
         # A turn stopped before this message arrived has already taken the question as refused.
@@ -357,11 +377,13 @@ class AgentCliApp(App):
         self.show_activity(Activity.GENERATING)
 
     @on(ToolDone)
+    @only_while_running
     async def show_tool_result(self, done: ToolDone) -> None:
         """Show how the tool shown last ended."""
         await done.turn.show_tool_result(done.result)
 
     @on(ReplyEnded)
+    @only_while_running
     async def finish_turn(self, ended: ReplyEnded) -> None:
         """Draw the rest of the reply, warn if it was cut, show the context in use and unlock the message box."""
         await ended.turn.finish()
@@ -379,12 +401,14 @@ class AgentCliApp(App):
             self.exit()
 
     @on(MessageTooLong)
+    @only_while_running
     async def refuse_long_message(self, refused: MessageTooLong) -> None:
         """Give back the message that does not fit in the model's context, which was not sent."""
         reason = "message not sent: it does not fit in the model's context"
         await self.give_message_back(refused.turn, reason, tone="warning")
 
     @on(ReplyFailed)
+    @only_while_running
     async def report_failed_reply(self, failed: ReplyFailed) -> None:
         """Give back the message whose reply failed, with the reason of the failure."""
         await self.give_message_back(failed.turn, f"the reply failed: {failed.reason}", tone="error")

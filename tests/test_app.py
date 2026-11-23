@@ -22,10 +22,11 @@ from agent_cli.inference.model import Model, ToolCall
 from agent_cli.screen.app import Activity, AgentCliApp
 from agent_cli.screen.banner import Banner
 from agent_cli.screen.messages import Notice, Reply, Thinking, ToolView, TurnView, thinking_and_answer_so_far
-from agent_cli.screen.permission import PermissionPrompt
+from agent_cli.screen.permission import PermissionAnswer, PermissionPrompt
 from agent_cli.screen.resume import ConversationPicker
 from agent_cli.screen.status import StatusLine
-from agent_cli.tools.toolbox import Toolbox
+from agent_cli.tools.tool import ToolResult
+from agent_cli.tools.toolbox import Toolbox, ToolUse
 from scripted_model import ScriptedModel
 
 SYSTEM_PROMPT = "Be brief."
@@ -819,6 +820,38 @@ async def test_closing_the_screen_while_a_tool_is_asked_about_lets_the_turn_end(
     while app.conversation.turns == [] and time.monotonic() < give_up_at:
         time.sleep(0.01)
     assert len(app.conversation.turns) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+# What each handler of a message from a background thread gets, built from a turn and a tool call of it.
+LATE_MESSAGES: dict[str, Callable[[TurnView, ToolUse], Any]] = {
+    "use_model": lambda turn, use: AgentCliApp.ModelLoaded(MODEL_NAME, 1000),
+    "report_model_not_opened": lambda turn, use: AgentCliApp.ModelFailedToLoad(MODEL_NAME, "gone"),
+    "show_piece": lambda turn, use: AgentCliApp.ReplyPiece(turn, "late"),
+    "show_tool": lambda turn, use: AgentCliApp.ToolAsked(turn, use),
+    "ask_about_tool": lambda turn, use: AgentCliApp.PermissionNeeded(turn, PermissionAnswer()),
+    "show_tool_result": lambda turn, use: AgentCliApp.ToolDone(turn, ToolResult("hi", "1 line")),
+    "finish_turn": lambda turn, use: AgentCliApp.ReplyEnded(turn, False, 1000),
+    "refuse_long_message": lambda turn, use: AgentCliApp.MessageTooLong(turn),
+    "report_failed_reply": lambda turn, use: AgentCliApp.ReplyFailed(turn, "late"),
+}
+
+
+@pytest.mark.parametrize("handler_name", list(LATE_MESSAGES))
+async def test_message_a_thread_posted_just_before_the_close_does_nothing_after_it(
+    tmp_path: Path, handler_name: str
+) -> None:
+    """Textual handles the messages still waiting after the screen is gone: each one is skipped instead of failing."""
+    app = session_in(tmp_path, ScriptedModel(["Ok."]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("hi", app, pilot)
+        await wait_for_message_box(app, pilot)
+        (turn,) = turns_on_screen(app)
+    # Closing stops the turn, which alone would make the question skip itself.
+    app.conversation.stop_requested.clear()
+    use = app.conversation.toolbox.read("write_file", json.dumps({"path": "new.txt", "content": "hi"}))
+    await getattr(app, handler_name)(LATE_MESSAGES[handler_name](turn, use))
     assert list(tmp_path.iterdir()) == []
 
 

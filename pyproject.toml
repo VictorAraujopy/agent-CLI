@@ -12,6 +12,7 @@ dependencies = [
     "textual==8.2.8",  # draws the screen and reads the keyboard; the terminal application framework
     "python-dotenv==1.2.4",  # reads the .env file; the parser for the KEY=value format
     "httpx==0.28.1",  # talks to llama-server and to OpenRouter and reads the reply as it arrives; the HTTP client
+    "sqlite-vec==0.1.9",  # lets SQLite compare vectors, for the search of earlier turns; a SQLite extension in C
 ]
 
 # The command the installation creates: typing agentcli calls main() of the main.py at the project root.

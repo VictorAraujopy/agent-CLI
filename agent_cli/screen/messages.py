@@ -160,6 +160,10 @@ class TurnView(Vertical):
         yield self.thinking
         yield self.reply
 
+    async def show_search(self, text: str, tone: str) -> None:
+        """Show, between the user's message and the first reply, how the search of earlier turns went."""
+        await self.mount(Notice(text, tone), before=self.thinking)
+
     async def add_piece(self, piece: str) -> None:
         """Add one piece of what the model writes: to the thinking, or to the reply once the thinking is over."""
         if self.reply_is_over:

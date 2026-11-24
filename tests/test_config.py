@@ -26,6 +26,7 @@ def test_nothing_configured_gives_empty_settings() -> None:
     assert settings.api_key is None
     assert settings.api_models == ()
     assert settings.system_prompt_path is None
+    assert settings.embedding_model is None
 
 
 def test_blank_values_count_as_not_configured() -> None:
@@ -34,11 +35,13 @@ def test_blank_values_count_as_not_configured() -> None:
         "AGENT_CLI_MODEL_PATH": "   ",
         "AGENT_CLI_API_KEY": " ",
         "AGENT_CLI_API_MODELS": " , ",
+        "AGENT_CLI_EMBEDDING_MODEL": "  ",
     }
     settings = build_settings(variables)
     assert settings.model_path is None
     assert settings.api_key is None
     assert settings.api_models == ()
+    assert settings.embedding_model is None
 
 
 def test_paths_lose_spaces_and_expand_the_home_folder() -> None:
@@ -164,6 +167,13 @@ def test_api_models_without_a_key_are_refused(variables: dict[str, str]) -> None
         check_models_configured(build_settings(variables))
 
 
+def test_embedding_model_without_a_key_is_refused() -> None:
+    """An embedding model with no key ends the program, instead of the search of earlier turns being off unseen."""
+    variables = {"AGENT_CLI_MODEL_PATH": "model.gguf", "AGENT_CLI_EMBEDDING_MODEL": "author/embedding"}
+    with pytest.raises(SystemExit, match="embedding model is configured without a key"):
+        check_models_configured(build_settings(variables))
+
+
 def test_settings_with_no_model_are_refused() -> None:
     """With no local model and no API model the program ends, naming the variables that configure one."""
     with pytest.raises(SystemExit, match="AGENT_CLI_MODEL_PATH or AGENT_CLI_API_MODELS"):
@@ -175,8 +185,9 @@ def test_settings_with_no_model_are_refused() -> None:
     [
         {"AGENT_CLI_MODEL_PATH": "model.gguf"},
         {"AGENT_CLI_API_KEY": "the-key", "AGENT_CLI_API_MODELS": "author/model"},
+        {"AGENT_CLI_MODEL_PATH": "model.gguf", "AGENT_CLI_API_KEY": "k", "AGENT_CLI_EMBEDDING_MODEL": "author/m"},
     ],
 )
 def test_a_local_model_or_api_models_with_their_key_are_accepted(variables: dict[str, str]) -> None:
-    """A local model alone, or API models with their key, are enough to start a session."""
+    """A local model alone, or API models with their key, are enough to start a session, with or without recall."""
     check_models_configured(build_settings(variables))

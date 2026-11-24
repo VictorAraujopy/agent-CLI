@@ -5,6 +5,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
+import sqlite_vec
+
 
 def create_database(database_file: Path) -> None:
     """Create the file, its folder and its tables when they are missing; only the user can read the conversations."""
@@ -13,6 +15,13 @@ def create_database(database_file: Path) -> None:
     schema = Path(__file__).with_name("schema.sql").read_text(encoding="utf-8")
     with transaction(database_file) as connection:
         connection.executescript(schema)
+
+
+def load_vector_functions(connection: sqlite3.Connection) -> None:
+    """Teach the connection to compare vectors, then refuse any other extension a query could ask to load."""
+    connection.enable_load_extension(True)
+    sqlite_vec.load(connection)
+    connection.enable_load_extension(False)
 
 
 @contextmanager

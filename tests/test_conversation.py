@@ -1,8 +1,10 @@
 """Tests for the conversation: the messages it keeps, the cut of the oldest turns, and each turn it runs."""
 
 import json
+import sqlite3
 import tempfile
-from collections.abc import Iterator, Sequence
+import threading
+from collections.abc import Callable, Iterator, Sequence
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,8 @@ import pytest
 from agent_cli.agent.conversation import (
     Conversation,
     MessageTooLongError,
+    RecallFailed,
+    Recalled,
     ToolEnded,
     ToolStarted,
     characters_in,
@@ -20,6 +24,7 @@ from agent_cli.agent.conversation import (
 from agent_cli.history.queries import History
 from agent_cli.inference.generation import LocalModel, open_local_model
 from agent_cli.inference.model import ContextFullError, Message, Model, ToolCall
+from agent_cli.rag.recall import with_recalled
 from agent_cli.tools.tool import Ending
 from agent_cli.tools.toolbox import Toolbox, ToolUse
 from scripted_model import ScriptedModel
@@ -108,13 +113,13 @@ def history_in_a_new_folder() -> History:
 
 def new_conversation(system_prompt: str = SYSTEM_PROMPT) -> Conversation:
     """Return a conversation for turns that run no tool, so its toolbox points at no real folder."""
-    return Conversation(system_prompt, Toolbox(Path("no-tool-runs-here")), history_in_a_new_folder())
+    return Conversation(system_prompt, Toolbox(Path("no-tool-runs-here")), history_in_a_new_folder(), recall=None)
 
 
 def conversation_in(folder: Path) -> Conversation:
     """Return a conversation whose tools act from the folder, with its history kept in another one."""
     history_folder = Path(tempfile.mkdtemp())
-    return Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_folder / "history.db", folder))
+    return Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_folder / "history.db", folder), recall=None)
 
 
 def no_permission_asked(use: ToolUse) -> bool:
@@ -400,7 +405,7 @@ def test_every_reply_of_a_turn_is_offered_the_tools(tmp_path: Path) -> None:
     """Each request of a turn carries the tools of the toolbox."""
     toolbox = Toolbox(tmp_path)
     model = ScriptedModel(["Ok."], tool_calls_by_reply=[[call("c1", "read_file", path="missing.txt")]])
-    conversation = Conversation(SYSTEM_PROMPT, toolbox, history_in_a_new_folder())
+    conversation = Conversation(SYSTEM_PROMPT, toolbox, history_in_a_new_folder(), recall=None)
     list(conversation.run_turn(model, "Read it", no_permission_asked))
     assert model.tools_received == [toolbox.schemas(), toolbox.schemas()]
 
@@ -545,3 +550,158 @@ def test_conversation_continued_sends_its_earlier_turns_and_cuts_by_its_saved_co
     assert model.conversations_received[0][1:] == exchange("Hi", "Hello.") + exchange("More", "Sure.") + [user("Again")]
     conversation.continue_from([exchange_of_size(500), exchange_of_size(500)], tokens_in_context=900)
     assert conversation.is_full(1000)
+
+
+class RecallThatFinds:
+    """Stands in for the search of earlier turns: it brings back the same excerpts each time, or fails as told."""
+
+    def __init__(self, excerpts: list[str], failure: Exception | None = None) -> None:
+        """Keep what each search gives, with no search made yet and nothing done during one."""
+        self.excerpts = excerpts
+        self.failure = failure
+        self.searches: list[tuple[str, int]] = []
+        self.stops_given: list[threading.Event] = []
+        self.while_searching: Callable[[], None] = lambda: None
+
+    def closest_excerpts(self, user_text: str, turns_in_context: int, stop_requested: threading.Event) -> list[str]:
+        """Remember what the search was asked for, do what the test set for its middle, and give its excerpts."""
+        self.searches.append((user_text, turns_in_context))
+        self.stops_given.append(stop_requested)
+        self.while_searching()
+        if self.failure is not None:
+            raise self.failure
+        return self.excerpts
+
+
+def conversation_recalling(recall: RecallThatFinds, folder: Path = Path("no-tool-runs-here")) -> Conversation:
+    """Return a conversation that searches earlier turns with the stand-in, whose tools act from the folder."""
+    return Conversation(SYSTEM_PROMPT, Toolbox(folder), history_in_a_new_folder(), recall)
+
+
+def test_model_reads_the_recalled_turns_with_the_message_but_the_turn_keeps_the_message_alone() -> None:
+    """What was recalled goes only to the model: the conversation and the history keep what the user wrote."""
+    excerpt = "User: a\nAssistant: b"
+    model = FakeModel(context_limit=1000, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds([excerpt]))
+    assert list(conversation.run_turn(model, "Hi", no_permission_asked)) == [Recalled(1), "Ok"]
+    assert model.conversations_received[0] == [SYSTEM_MESSAGE, with_recalled(user("Hi"), [excerpt])]
+    assert conversation.messages() == [SYSTEM_MESSAGE, *exchange("Hi", "Ok")]
+    [saved] = conversation.history.conversations_in_folder()
+    assert conversation.history.resume(saved.id)[0].messages == exchange("Hi", "Ok")
+
+
+def test_recalled_turns_go_with_every_reply_of_the_turn_and_not_with_the_next_turn(tmp_path: Path) -> None:
+    """The reply after a tool reads the same recalled turns; the next turn reads only its own search."""
+    (tmp_path / "notes.txt").write_text("hello\n")
+    model = ScriptedModel(["Ok."], tool_calls_by_reply=[[call("c1", "read_file", path="notes.txt")]])
+    recall = RecallThatFinds(["User: a\nAssistant: b"])
+    conversation = conversation_recalling(recall, tmp_path)
+    list(conversation.run_turn(model, "Read it", no_permission_asked))
+    first_reply, reply_after_the_tool = model.conversations_received
+    assert first_reply[1] == reply_after_the_tool[1] == with_recalled(user("Read it"), ["User: a\nAssistant: b"])
+    recall.excerpts = []
+    list(conversation.run_turn(model, "Thanks", no_permission_asked))
+    assert model.conversations_received[2][1] == user("Read it")
+    assert model.conversations_received[2][-1] == user("Thanks")
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        ConnectionError("the connection to OpenRouter failed: no route to host"),
+        sqlite3.OperationalError("database is locked"),
+        KeyError("data"),
+    ],
+)
+def test_search_that_fails_is_told_and_the_turn_goes_on_without_it(failure: Exception) -> None:
+    """A failed search, of the network, of the history or of the answer, ends nothing: the model gets the message."""
+    model = FakeModel(context_limit=1000, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds([], failure))
+    events = list(conversation.run_turn(model, "Hi", no_permission_asked))
+    assert events == [RecallFailed(str(failure)), "Ok"]
+    assert model.conversations_received[0] == [SYSTEM_MESSAGE, user("Hi")]
+
+
+def test_search_is_given_the_stop_of_the_conversation() -> None:
+    """The search sees the stop of the turn, so a long indexing ends when the user stops the turn."""
+    recall = RecallThatFinds([])
+    conversation = conversation_recalling(recall)
+    list(conversation.run_turn(FakeModel(context_limit=1000, reply_pieces=["Ok"]), "Hi", no_permission_asked))
+    assert recall.stops_given == [conversation.stop_requested]
+
+
+def test_search_that_fails_after_one_that_recalled_sends_none_of_the_turns_recalled_before() -> None:
+    """What an earlier search brought back is for its own turn: a failed search leaves the message alone."""
+    model = FakeModel(context_limit=1000, reply_pieces=["Ok"])
+    recall = RecallThatFinds(["User: a\nAssistant: b"])
+    conversation = conversation_recalling(recall)
+    list(conversation.run_turn(model, "Hi", no_permission_asked))
+    recall.failure = ConnectionError("the connection to OpenRouter failed: no route to host")
+    list(conversation.run_turn(model, "Again", no_permission_asked))
+    assert model.conversations_received[1][-1] == user("Again")
+
+
+def test_search_that_finds_nothing_tells_nothing() -> None:
+    """With no turn close enough, the turn runs as it would with no search."""
+    model = FakeModel(context_limit=1000, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds([]))
+    assert list(conversation.run_turn(model, "Hi", no_permission_asked)) == ["Ok"]
+    assert model.conversations_received[0] == [SYSTEM_MESSAGE, user("Hi")]
+
+
+def test_search_runs_after_the_cut_and_leaves_out_the_turns_the_model_still_reads() -> None:
+    """The search gets how many turns stay in the context once the cut ran, so the turns cut can be recalled."""
+    recall = RecallThatFinds([])
+    conversation = conversation_recalling(recall)
+    for _ in range(3):
+        conversation.add_turn(exchange_of_size(300), tokens_in_context_after_reply=900)
+    list(conversation.run_turn(FakeModel(context_limit=1000, reply_pieces=["Ok"]), "Hi", no_permission_asked))
+    assert recall.searches == [("Hi", 1)]
+
+
+def test_turn_stopped_during_the_search_asks_the_model_nothing(tmp_path: Path) -> None:
+    """A stop during the search keeps the message with an empty reply, and nothing of the last reply is taken again."""
+    write = call("c1", "write_file", path="new.txt", content="hi")
+    model = ScriptedModel(["Ok."], tool_calls_by_reply=[[write]])
+    recall = RecallThatFinds([])
+    conversation = conversation_recalling(recall, tmp_path)
+    list(conversation.run_turn(model, "Write it", UserThatAnswers(allows=False)))
+    model.cut = True
+    recall.while_searching = conversation.stop
+    assert list(conversation.run_turn(model, "Again", UserThatAnswers(allows=True))) == []
+    assert conversation.turns[-1].messages == exchange("Again", "")
+    assert not conversation.turn_was_cut
+    assert len(model.conversations_received) == 1
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_recalled_turns_leave_before_the_earlier_turns_when_the_conversation_does_not_fit() -> None:
+    """What was recalled is only an aid: when it is what overflows, it leaves and the earlier turns stay."""
+    model = FakeModel(context_limit=300, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds(["User: a\nAssistant: " + "b" * 200]))
+    conversation.add_turn(exchange_of_size(100), tokens_in_context_after_reply=10)
+    assert list(conversation.run_turn(model, "Hi", no_permission_asked)) == [Recalled(1), "Ok"]
+    assert model.conversations_received[1] == [SYSTEM_MESSAGE, *exchange_of_size(100), user("Hi")]
+    assert conversation.messages() == [SYSTEM_MESSAGE, *exchange_of_size(100), *exchange("Hi", "Ok")]
+
+
+def test_tokens_kept_after_a_recall_leave_out_what_was_recalled() -> None:
+    """The count kept for the cut is of what the next turn sends, which no longer carries the recalled turns."""
+    model = FakeModel(context_limit=1000, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds(["User: a\nAssistant: " + "b" * 300]))
+    list(conversation.run_turn(model, "Hi", no_permission_asked))
+    assert model.tokens > characters_in(conversation.messages())
+    assert conversation.tokens_in_context == characters_in(conversation.messages())
+    [saved] = conversation.history.conversations_in_folder()
+    assert saved.tokens_in_context == conversation.tokens_in_context
+
+
+def test_message_sent_again_without_the_earlier_turns_goes_without_what_was_recalled() -> None:
+    """When even the conversation without the recalled turns does not fit, the earlier turns leave too."""
+    model = FakeModel(context_limit=50, reply_pieces=["Ok"])
+    conversation = conversation_recalling(RecallThatFinds(["User: a\nAssistant: " + "b" * 100]))
+    conversation.add_turn(exchange_of_size(100), tokens_in_context_after_reply=10)
+    assert list(conversation.run_turn(model, "Hi", no_permission_asked)) == [Recalled(1), "Ok"]
+    with_the_earlier_turns, alone = model.conversations_received[1:]
+    assert with_the_earlier_turns == [SYSTEM_MESSAGE, *exchange_of_size(100), user("Hi")]
+    assert alone == [SYSTEM_MESSAGE, user("Hi")]

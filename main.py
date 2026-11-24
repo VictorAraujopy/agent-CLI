@@ -13,6 +13,8 @@ from agent_cli.inference.api import open_api_model, open_client
 from agent_cli.inference.catalog import Catalog
 from agent_cli.inference.generation import open_local_model
 from agent_cli.inference.model import Model
+from agent_cli.rag.embeddings import EmbeddingModel
+from agent_cli.rag.recall import Recall
 from agent_cli.screen.app import AgentCliApp
 from agent_cli.tools.toolbox import Toolbox
 
@@ -28,6 +30,14 @@ def models_configured(settings: Settings) -> dict[str, Callable[[], Model]]:
         for name in settings.api_models:
             how_to_open[name] = partial(open_api_model, client, name)
     return how_to_open
+
+
+def recall_configured(settings: Settings, history: History) -> Recall | None:
+    """Return the search of earlier turns when an embedding model is configured, otherwise None."""
+    if settings.embedding_model is None:
+        return None
+    embedding_model = EmbeddingModel(open_client(settings.api_key), settings.embedding_model)
+    return Recall(embedding_model, history)
 
 
 def arguments_given() -> argparse.Namespace:
@@ -56,7 +66,8 @@ def main() -> None:
     working_folder = Path.cwd()
     toolbox = Toolbox(working_folder)
     history = History(history_file(), working_folder)
-    conversation = Conversation(system_prompt, toolbox, history)
+    recall = recall_configured(settings, history)
+    conversation = Conversation(system_prompt, toolbox, history, recall)
     catalog = Catalog(how_to_open)
     app = AgentCliApp(conversation, catalog, resume=arguments.resume)
     try:

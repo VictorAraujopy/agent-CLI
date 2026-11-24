@@ -1,12 +1,13 @@
-"""The queries of the history: each turn saved as it ends, and the conversations of a folder read back."""
+"""The queries of the history: each turn saved as it ends, the conversations read back, and the excerpts."""
 
 import json
 import sqlite3
+from array import array
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from agent_cli.history.database import create_database, transaction
+from agent_cli.history.database import create_database, load_vector_functions, transaction
 from agent_cli.inference.model import Message
 from agent_cli.tools.tool import Ending, ToolResult
 
@@ -27,6 +28,25 @@ class SavedTurn:
 
     messages: list[Message]
     tool_results: dict[str, ToolResult]
+
+
+@dataclass(frozen=True)
+class TurnToIndex:
+    """A turn of the folder with no excerpt yet: where it is, and the messages of the user and the model in it."""
+
+    conversation_id: int
+    turn: int
+    messages: list[Message]
+
+
+@dataclass(frozen=True)
+class SavedExcerpt:
+    """The text of a turn that the search of earlier turns can bring back, and the vector it is found by."""
+
+    conversation_id: int
+    turn: int
+    text: str
+    vector: list[float]
 
 
 def now() -> str:
@@ -72,13 +92,18 @@ def row_of(message: Message, tool_results: dict[str, ToolResult]) -> dict[str, o
     return row
 
 
+def last_turn_of(connection: sqlite3.Connection, conversation_id: int | None) -> int:
+    """Return the number of the last turn saved in the conversation, 0 when it has none."""
+    return connection.execute(
+        "SELECT COALESCE(MAX(turn), 0) FROM messages WHERE conversation_id = ?", (conversation_id,)
+    ).fetchone()[0]
+
+
 def insert_turn(
     connection: sqlite3.Connection, conversation_id: int, messages: list[Message], tool_results: dict[str, ToolResult]
 ) -> None:
     """Add the messages of the next turn of the conversation, with what the screen showed of each tool result."""
-    last_turn = connection.execute(
-        "SELECT COALESCE(MAX(turn), 0) FROM messages WHERE conversation_id = ?", (conversation_id,)
-    ).fetchone()[0]
+    last_turn = last_turn_of(connection, conversation_id)
     for message in messages:
         row = {"conversation_id": conversation_id, "turn": last_turn + 1, **row_of(message, tool_results)}
         connection.execute(
@@ -109,6 +134,21 @@ def turns_in(rows: list[sqlite3.Row]) -> list[SavedTurn]:
             ending = Ending(row["tool_ending"])
             turn.tool_results[row["tool_call_id"]] = ToolResult(row["content"], row["tool_summary"], ending)
     return list(turns.values())
+
+
+def turns_to_index_in(rows: list[sqlite3.Row]) -> list[TurnToIndex]:
+    """Group the rows of messages of several conversations, in order, into their turns."""
+    turns: dict[tuple[int, int], TurnToIndex] = {}
+    for row in rows:
+        place = (row["conversation_id"], row["turn"])
+        turn = turns.setdefault(place, TurnToIndex(row["conversation_id"], row["turn"], []))
+        turn.messages.append(message_of(row))
+    return list(turns.values())
+
+
+def bytes_of(vector: list[float]) -> bytes:
+    """Return the vector as the history keeps it: each number a 32-bit float."""
+    return array("f", vector).tobytes()
 
 
 class History:
@@ -155,3 +195,56 @@ class History:
             ).fetchall()
         self.conversation_id = conversation_id
         return turns_in(rows)
+
+    def turns_with_no_excerpt(self, embedding_model: str) -> list[TurnToIndex]:
+        """Return the turns of the folder the embedding model made no vector of yet, without their tool results."""
+        with transaction(self.database_file) as connection:
+            rows = connection.execute(
+                "SELECT messages.* FROM messages JOIN conversations ON conversations.id = messages.conversation_id"
+                " WHERE working_folder = ? AND role != 'tool' AND NOT EXISTS (SELECT 1 FROM excerpts"
+                " WHERE excerpts.conversation_id = messages.conversation_id AND excerpts.turn = messages.turn"
+                " AND excerpts.embedding_model = ?) ORDER BY messages.id",
+                (self.working_folder, embedding_model),
+            ).fetchall()
+        return turns_to_index_in(rows)
+
+    def save_excerpts(self, embedding_model: str, excerpts: list[SavedExcerpt]) -> None:
+        """Keep the excerpt of each turn with the vector the embedding model made of it."""
+        rows = [
+            (excerpt.conversation_id, excerpt.turn, embedding_model, excerpt.text, bytes_of(excerpt.vector))
+            for excerpt in excerpts
+        ]
+        with transaction(self.database_file) as connection:
+            # OR IGNORE: two sessions open in the same folder can index the same turn at the same time.
+            connection.executemany(
+                "INSERT OR IGNORE INTO excerpts (conversation_id, turn, embedding_model, text, vector)"
+                " VALUES (?, ?, ?, ?, ?)",
+                rows,
+            )
+
+    def excerpts_closest_to(
+        self, embedding_model: str, vector: list[float], turns_in_context: int, minimum_similarity: float, how_many: int
+    ) -> list[str]:
+        """Return the folder's excerpts closest to the vector, closest first, leaving out the turns in the context."""
+        with transaction(self.database_file) as connection:
+            # Only here: a Python whose SQLite cannot load extensions still keeps and reads back the history.
+            load_vector_functions(connection)
+            first_turn_in_context = last_turn_of(connection, self.conversation_id) - turns_in_context + 1
+            rows = connection.execute(
+                "SELECT text FROM (SELECT text, 1 - vec_distance_cosine(vector, :vector) AS similarity FROM excerpts"
+                " JOIN conversations ON conversations.id = excerpts.conversation_id"
+                " WHERE working_folder = :working_folder AND embedding_model = :embedding_model"
+                # IS and not =: a session with no turn saved has no conversation, and NULL = NULL is not true.
+                " AND NOT (conversation_id IS :conversation_id AND turn >= :first_turn_in_context))"
+                " WHERE similarity > :minimum_similarity ORDER BY similarity DESC LIMIT :how_many",
+                {
+                    "vector": bytes_of(vector),
+                    "working_folder": self.working_folder,
+                    "embedding_model": embedding_model,
+                    "conversation_id": self.conversation_id,
+                    "first_turn_in_context": first_turn_in_context,
+                    "minimum_similarity": minimum_similarity,
+                    "how_many": how_many,
+                },
+            ).fetchall()
+        return [row["text"] for row in rows]

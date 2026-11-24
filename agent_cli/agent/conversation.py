@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from agent_cli.history.queries import History
 from agent_cli.inference.model import ContextFullError, Message, Model, ToolCall
+from agent_cli.rag.recall import Recall, with_recalled
 from agent_cli.tools.tool import Ending, ToolResult
 from agent_cli.tools.toolbox import Toolbox, ToolUse
 
@@ -36,6 +37,24 @@ class ToolEnded:
 
     use: ToolUse
     result: ToolResult
+
+
+@dataclass(frozen=True)
+class Recalled:
+    """The search brought back this many earlier turns, which the model reads with the user's message."""
+
+    turns: int
+
+
+@dataclass(frozen=True)
+class RecallFailed:
+    """The search of earlier turns failed, for this reason, and the turn goes on without it."""
+
+    reason: str
+
+
+# What a turn tells whoever runs it, in order: what the search found, each piece of a reply, each tool.
+TurnEvent = Recalled | RecallFailed | str | ToolStarted | ToolEnded
 
 
 def characters_in(messages: list[Message]) -> int:
@@ -76,11 +95,15 @@ def calls_with_no_result(messages: list[Message]) -> list[str]:
 class Conversation:
     """What is sent to the model: the system prompt first, then the turns that still fit in the context."""
 
-    def __init__(self, system_prompt: str, toolbox: Toolbox, history: History) -> None:
-        """Start a conversation that holds only the system prompt, offers the tools, and saves each turn it keeps."""
+    def __init__(self, system_prompt: str, toolbox: Toolbox, history: History, recall: Recall | None) -> None:
+        """Start a conversation with only the system prompt, which offers the tools, saves each turn and may recall."""
         self.system_message = {"role": "system", "content": system_prompt}
         self.toolbox = toolbox
         self.history = history
+        # None when no embedding model is configured: then the turns never leave this machine to be searched.
+        self.recall = recall
+        # What the search brought back for the turn being run, which the model reads with the user's message.
+        self.recalled: list[str] = []
         self.turns: list[Turn] = []
         # The tokens the model counted in its context when the last turn ended. After a cut it is an estimate,
         # until the next turn ends and the model counts again.
@@ -129,14 +152,16 @@ class Conversation:
 
     def run_turn(
         self, model: Model, user_text: str, ask_permission: Callable[[ToolUse], bool]
-    ) -> Iterator[str | ToolStarted | ToolEnded]:
-        """Send the user's message, yield each reply piece by piece and each tool it runs, and keep it all."""
+    ) -> Iterator[TurnEvent]:
+        """Send the user's message with what the search recalls, yield each reply and each tool, and keep it all."""
         self.stop_requested.clear()
         self.turn_was_cut = False
         self.tool_results = {}
         context_limit = model.context_limit()
         if self.is_full(context_limit):
             self.cut_oldest_turns(context_limit)
+        # After the cut, so the turns it just left out can be recalled.
+        yield from self.search_earlier_turns(user_text)
         turn_messages: list[Message] = [{"role": "user", "content": user_text}]
         try:
             yield from self.replies_and_tools(model, turn_messages, ask_permission)
@@ -146,10 +171,33 @@ class Conversation:
             raise
         self.keep_turn(model, turn_messages)
 
+    def search_earlier_turns(self, user_text: str) -> Iterator[Recalled | RecallFailed]:
+        """Keep the earlier turns closest to the message for the model to read, and yield how the search went."""
+        self.recalled = []
+        if self.recall is None:
+            return
+        try:
+            self.recalled = self.recall.closest_excerpts(user_text, len(self.turns), self.stop_requested)
+        except Exception as error:
+            # The search only adds to the turn, so no failure of it, of the network or of the history, ends the turn.
+            yield RecallFailed(str(error))
+            return
+        if self.recalled:
+            yield Recalled(len(self.recalled))
+
+    def messages_to_send(self, turn_messages: list[Message]) -> list[Message]:
+        """Return what the model reads: the conversation, then the turn, its first message with what was recalled."""
+        user_message, *rest_of_the_turn = turn_messages
+        return self.messages() + [with_recalled(user_message, self.recalled), *rest_of_the_turn]
+
     def replies_and_tools(
         self, model: Model, turn_messages: list[Message], ask_permission: Callable[[ToolUse], bool]
     ) -> Iterator[str | ToolStarted | ToolEnded]:
         """Yield each reply and the tools it asks for, until a reply asks for none or the turn stops."""
+        if self.stop_requested.is_set():
+            # Stopped during the search: the model is not asked, and the reply stays empty, as one stopped at once.
+            turn_messages.append(reply_message("", []))
+            return
         while True:
             try:
                 yield from self.next_reply(model, turn_messages)
@@ -181,11 +229,23 @@ class Conversation:
             turn_messages.append(reply_message("".join(reply_pieces), []))
             raise
         turn_messages.append(reply_message("".join(reply_pieces), model.tool_calls()))
+        self.turn_was_cut = self.turn_was_cut or model.reply_was_cut()
 
     def reply_that_fits(self, model: Model, turn_messages: list[Message]) -> Iterator[str]:
-        """Yield the reply to the conversation and the turn, leaving the earlier turns out if they do not fit."""
+        """Yield the reply to the conversation and the turn, leaving out what was recalled first if they do not fit."""
         try:
-            yield from model.reply(self.messages() + turn_messages, self.toolbox.schemas())
+            yield from model.reply(self.messages_to_send(turn_messages), self.toolbox.schemas())
+        except ContextFullError:
+            yield from self.reply_without_what_was_recalled(model, turn_messages)
+
+    def reply_without_what_was_recalled(self, model: Model, turn_messages: list[Message]) -> Iterator[str]:
+        """Yield the reply with no recalled turns; with none to leave out, or still too long, with no earlier turns."""
+        if not self.recalled:
+            yield from self.reply_with_no_earlier_turns(model, turn_messages)
+            return
+        self.recalled = []
+        try:
+            yield from model.reply(self.messages_to_send(turn_messages), self.toolbox.schemas())
         except ContextFullError:
             yield from self.reply_with_no_earlier_turns(model, turn_messages)
 
@@ -194,7 +254,7 @@ class Conversation:
         earlier_turns = self.turns
         self.turns = []
         try:
-            yield from model.reply(self.messages() + turn_messages, self.toolbox.schemas())
+            yield from model.reply(self.messages_to_send(turn_messages), self.toolbox.schemas())
         except ContextFullError as error:
             # Not even the turn alone fits. It is not sent, so the conversation goes back to how it was.
             self.turns = earlier_turns
@@ -232,7 +292,12 @@ class Conversation:
         for call_id in calls_with_no_result(turn_messages):
             turn_messages.append(tool_message(call_id, NOT_RUN.text))
             self.tool_results[call_id] = NOT_RUN
-        self.turn_was_cut = self.turn_was_cut or model.reply_was_cut()
-        tokens_in_context = model.tokens_in_use()
+        tokens_in_context = self.tokens_without_what_was_recalled(model.tokens_in_use(), turn_messages)
         self.history.save_turn(turn_messages, self.tool_results, tokens_in_context)
         self.add_turn(turn_messages, tokens_in_context)
+
+    def tokens_without_what_was_recalled(self, tokens_counted: int, turn_messages: list[Message]) -> int:
+        """Return the tokens the model counted less the share of what was recalled, which no later turn sends."""
+        characters_sent = characters_in(self.messages_to_send(turn_messages))
+        characters_kept = characters_in(self.messages() + turn_messages)
+        return round(tokens_counted * characters_kept / characters_sent)

@@ -19,6 +19,7 @@ class Settings:
     api_key: str | None = field(repr=False)
     api_models: tuple[str, ...]
     system_prompt_path: Path | None
+    embedding_model: str | None
 
 
 def read_variables(env_file: Path, environment: Mapping[str, str]) -> dict[str, str]:
@@ -58,6 +59,7 @@ def build_settings(variables: Mapping[str, str]) -> Settings:
         api_key=text_or_none(variables, "AGENT_CLI_API_KEY"),
         api_models=items_of(variables, "AGENT_CLI_API_MODELS"),
         system_prompt_path=path_or_none(variables, "AGENT_CLI_SYSTEM_PROMPT_PATH"),
+        embedding_model=text_or_none(variables, "AGENT_CLI_EMBEDDING_MODEL"),
     )
 
 
@@ -78,5 +80,7 @@ def check_models_configured(settings: Settings) -> None:
     """End the program when the settings give the session no model it can open."""
     if settings.api_models and settings.api_key is None:
         raise SystemExit("agent-CLI: API models are configured without a key. Set AGENT_CLI_API_KEY in the .env file.")
+    if settings.embedding_model is not None and settings.api_key is None:
+        raise SystemExit("agent-CLI: an embedding model is configured without a key. Set AGENT_CLI_API_KEY in .env.")
     if settings.model_path is None and not settings.api_models:
         raise SystemExit("agent-CLI: no model configured. Set AGENT_CLI_MODEL_PATH or AGENT_CLI_API_MODELS in .env.")

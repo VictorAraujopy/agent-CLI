@@ -14,7 +14,15 @@ from textual.message import Message
 from textual.suggester import SuggestFromList
 from textual.widgets import Input
 
-from agent_cli.agent.conversation import Conversation, MessageTooLongError, ToolEnded, ToolStarted
+from agent_cli.agent.conversation import (
+    Conversation,
+    MessageTooLongError,
+    RecallFailed,
+    Recalled,
+    ToolEnded,
+    ToolStarted,
+    TurnEvent,
+)
 from agent_cli.commands import completions, is_command, run_command
 from agent_cli.history.queries import SavedConversation, SavedTurn
 from agent_cli.inference.catalog import Catalog
@@ -78,6 +86,14 @@ class AgentCliApp(App):
 
         name: str
         reason: str
+
+    @dataclass
+    class EarlierTurnsSearched(Message):
+        """The search of earlier turns ended, before the reply of a turn: what the screen says of it, in which tone."""
+
+        turn: TurnView
+        text: str
+        tone: str
 
     @dataclass
     class ReplyPiece(Message):
@@ -298,8 +314,12 @@ class AgentCliApp(App):
         else:
             self.post_message(self.ReplyEnded(turn, self.conversation.turn_was_cut, model.context_limit()))
 
-    def message_about(self, turn: TurnView, event: str | ToolStarted | ToolEnded) -> Message:
-        """Return the message that tells the screen what happened in the turn: a piece, a tool asked for or ended."""
+    def message_about(self, turn: TurnView, event: TurnEvent) -> Message:
+        """Return the message that tells the screen what happened in the turn: a search, a piece, a tool."""
+        if isinstance(event, Recalled):
+            return self.EarlierTurnsSearched(turn, f"earlier turns recalled: {event.turns}", "muted")
+        if isinstance(event, RecallFailed):
+            return self.EarlierTurnsSearched(turn, f"earlier turns not searched: {event.reason}", "warning")
         if isinstance(event, ToolStarted):
             return self.ToolAsked(turn, event.use)
         if isinstance(event, ToolEnded):
@@ -341,6 +361,12 @@ class AgentCliApp(App):
     def stop_reply_when_closing(self) -> None:
         """Stop the reply when the app closes, so one still being written does not hold the terminal."""
         self.action_stop_reply()
+
+    @on(EarlierTurnsSearched)
+    @only_while_running
+    async def show_search(self, searched: EarlierTurnsSearched) -> None:
+        """Show under the user's message what the search of earlier turns brought back, or why it failed."""
+        await searched.turn.show_search(searched.text, searched.tone)
 
     @on(ReplyPiece)
     @only_while_running

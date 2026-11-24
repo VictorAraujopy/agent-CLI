@@ -2,15 +2,16 @@
 
 A terminal agent that runs any GGUF model directly on your machine, or any model on OpenRouter. Models are configured through environment variables, and you switch between them without leaving the session.
 
-> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. The model reads, writes and edits files and runs commands, and asks you first for anything that changes something. Every turn is saved in a history, and `agentcli -r` continues an earlier conversation of the folder.
+> **Status:** early development. A session with a local model works: the model loads in the background, alone or split with RPC servers, and its reply appears on the screen piece by piece. `/model` switches between the local model and the ones on OpenRouter, and `/think` chooses how much the model in use thinks. The model reads, writes and edits files and runs commands, and asks you first for anything that changes something. Every turn is saved in a history, and `agentcli -r` continues an earlier conversation of the folder. With an embedding model configured, each message also brings to the model the closest earlier turns of the folder.
 
 ## The idea
 
-- **Local first.** By default the CLI starts `llama-server`, the server program of llama.cpp, with the model file on your machine, and stops it when the session ends. It answers only on this machine, and nothing leaves it.
+- **Local first.** By default the CLI starts `llama-server`, the server program of llama.cpp, with the model file on your machine, and stops it when the session ends. It answers only on this machine, and nothing leaves it unless you configure an API.
 - **Any GGUF model.** The project was born to run ADA, the author's own model, but nothing in the code knows which model is running. Whatever changes from one model to another comes from outside, through an environment variable.
 - **OpenRouter when you want it.** The same CLI can instead send the conversation to a model on OpenRouter. It is only used when you configure it, and when a local model is configured too, the session starts on the local one.
 - **Switch models inside the session.** `/model` lists the models you configured, local and API, and switches between them. The conversation continues, and every model gets the same tools.
 - **An agent, not just a chat.** The model can ask for a tool (read a file, run a command), and the CLI is the one that executes it.
+- **Earlier conversations recalled, when you want it.** With an embedding model configured, each message is searched among the earlier turns of the folder, and the closest ones go to the model with it. The search runs on OpenRouter, so it is off unless you turn it on.
 - **Your own system prompt.** A variable points to a text file with the system prompt, so you change how the agent behaves without touching the code.
 
 ## How it works
@@ -21,6 +22,10 @@ environment variables ──► llama-server loads the .gguf ──► session o
 inside the session, for each message:
 
   you type
+      │
+      ▼
+  the closest earlier turns of the folder join your message
+  (only when an embedding model is configured)
       │
       ▼
   the conversation is formatted the way the model expects
@@ -50,7 +55,8 @@ The parts, by the role each one plays:
 | Generation | Sends the conversation to `llama-server` or to OpenRouter and returns the response piece by piece, read the same way for both. It never prints anything. |
 | Conversation | Keeps the messages, which start with the system prompt, and runs each turn: asks for the generation, runs the tools each reply asks for once you allow them, and gives the results back to the model until a reply asks for none. |
 | Tools | Reading, writing and editing a file, and running a command. Checks the arguments the model wrote, runs the call and returns the result, or the reason it failed, for the model to read. The same tools for every model. |
-| History | Saves each turn as it ends, in a SQLite file in your home folder, and reads back the conversations of a folder for `agentcli -r`. |
+| History | Saves each turn as it ends, in a SQLite file in your home folder, and reads back the conversations of a folder for `agentcli -r`. It also keeps the vectors of the recall. |
+| Recall | Only with an embedding model. Turns each message and each earlier turn of the folder into a vector on OpenRouter, and hands the conversation the turns closest in meaning to the message. |
 | Commands | Session commands, which start with `/`: `/model` and `/think`. |
 | Screen | The terminal session: reads what you type and shows what arrives. |
 
@@ -65,6 +71,7 @@ Everything is set through environment variables, in a `.env` file that stays out
 | `AGENT_CLI_API_KEY` | Secret key of your OpenRouter account | For API models |
 | `AGENT_CLI_API_MODELS` | Names of the models on OpenRouter, written as OpenRouter lists them, separated by commas. The first one is the default. | For API models |
 | `AGENT_CLI_SYSTEM_PROMPT_PATH` | Path to a text file with the system prompt. A relative path starts at the project folder. When empty, the project's default prompt is used. A file with no text is an error. | No |
+| `AGENT_CLI_EMBEDDING_MODEL` | Name of an embedding model on OpenRouter, written as OpenRouter lists it. It turns on the recall of earlier turns and needs `AGENT_CLI_API_KEY`. When empty, nothing is searched. | No |
 
 `/model` offers every model that is configured: the local one when `AGENT_CLI_MODEL_PATH` is filled in, and each name in `AGENT_CLI_API_MODELS`. The session starts on the local model when there is one, otherwise on the first API model.
 
@@ -97,8 +104,15 @@ Everything is set through environment variables, in a `.env` file that stays out
 | Long files and outputs reach the model in parts | A file comes in parts of at most 500 lines and 40,000 characters, each telling where the next starts, so one read never fills a small context. A command's output keeps its last 20,000 characters, where errors and summaries usually are. A command gets no input, runs in a session of its own, and is ended after 120 seconds. |
 | A turn whose tool results fill the context is kept | The tools already changed files, so the conversation keeps what they did, and the turn ends as a reply cut by the full context. The next turn cuts the oldest turns as usual. |
 | The system prompt in a text file, with its path in a variable | Each user writes their own without touching the code. A file takes a prompt of any size, which would be awkward to write and to read inside `.env`. |
-| A database only for history | It is the only thing that has to survive after the CLI closes. |
+| A database only for history | It is the only thing that has to survive after the CLI closes, with the vectors the recall made of it. |
 | History in SQLite, one file in your home folder | `sqlite3` comes with Python, and one file keeps the conversations of every folder, each under the folder it happened in, as the tools act on that folder. Each turn is saved when it ends, so closing or a crash loses at most the turn being written. The cut of the context leaves turns out of what goes to the model, never out of the history. The system prompt is not saved: it is a setting, and a conversation continued later uses the prompt of that day. |
+| Recall of earlier turns as an opt-in, with a variable of its own | To be searched, the message and the turns of the folder are sent to OpenRouter, even when the conversation runs on the local model. So the key alone never turns the search on, as it may be there only for API models, and an embedding model named without a key ends the program at start, instead of a search that is off without telling. Requests go only to providers that keep no data, as for the API models. |
+| A turn is searched and recalled as one excerpt | The user's message and the model's last answer, without its thinking and without the results of its tools, cut at 1,500 characters: what the turn asked and what it concluded. Tool results are left out because they are often whole files. Each excerpt and its vector are kept in the history file next to their turn, once for each embedding model, as the vectors of two models cannot be compared. |
+| One request per message, once the folder is indexed | The request that turns the message into a vector also carries up to nine turns that have none yet. Any other turn without a vector goes in later requests, ten texts each, and each request is saved as soon as it returns: one that fails loses only itself, and `esc` is seen between two of them. The first message after the recall is turned on indexes every earlier turn of the folder; from then on, a message carries only the turn before it. A turn kept with no reply is found by your message alone. |
+| Up to three turns, and only close ones | The turns closest to the message, closest first, whose similarity (the cosine of the angle between the two vectors) is above 0.6. Measured with `google/gemini-embedding-001`, turns about the same subject gave 0.77 to 0.80 and unrelated ones 0.42 to 0.57. The scale of the cosine changes from one embedding model to another, so another model may need another number. The turns the model still reads in the conversation are left out; those the cut left out can come back. |
+| The vectors are compared inside SQLite, by `sqlite-vec` | `sqlite-vec` is an extension of SQLite, written in C, that gives SQL a cosine distance. The search is one query that compares the message with every vector of the folder in the history file and hands back only the closest three, so the CLI never holds the vectors in its memory, and the memory a local model gets is not taken by a history that grows. Measured with vectors of 3,072 numbers: 8 ms with 1,000 turns, 33 ms with 5,000, and 350 ms with 55,000 (a file of 790 MB), with the process under 25 MB. The search is exact, so it reads every vector; an approximate index would only pay off far beyond that. The vectors stay in an ordinary table, as 32-bit floats, because the tables of `sqlite-vec` need the length of the vector written in them, and that length changes from one embedding model to another. Only the search loads the extension, so a Python whose `sqlite3` cannot load extensions still keeps and continues every conversation: only the search fails, with a warning. |
+| What was recalled goes at the start of the message, for that turn only | Between `<recalled>` tags, before what you wrote. Not in the system prompt, because a system prompt that changes every turn makes llama.cpp read the whole conversation again; and not as a message of its own, because the templates of some models refuse a system message in the middle or two user messages in a row. It is kept neither in the conversation nor in the history: each turn reads its own search, and a conversation continued with `-r` shows only what you wrote. The cost is that the next turn sends that message without what was recalled, so llama.cpp reads the conversation again from that message on, the last turn and the new one. The tokens kept for the cut leave out the share of what was recalled, as the next turn does not send it. When the conversation does not fit, what was recalled leaves first; if it still does not fit, the earlier turns leave too, as they would with no recall. |
+| A search that fails does not stop the turn | The screen says why, and the model gets the message alone, so a local model keeps working with no network. `esc` during the search does not cut the request short: the turn ends as soon as the search returns, before the model is asked. |
 | `agentcli -r` opens a list over the screen | The earlier conversations of the folder, the newest first: the arrows choose, `enter` continues one and `esc` starts a new one. The one chosen is drawn back on the screen and goes to the model with the next message, with the size it had in the context, so the cut works as before. |
 
 ### The accepted cost
@@ -108,6 +122,8 @@ A local model has to be loaded into memory, and it leaves memory when the CLI cl
 The model runs in a second program, `llama-server`, that has to be installed apart from the CLI, as the installation below shows.
 
 With an API model, what the model thinks is billed as output, and a model starts with as much thinking as it accepts until `/think` chooses less.
+
+With the recall on, each message waits for the search before the model starts: about 1.2 seconds with `google/gemini-embedding-001`. The first message after turning it on also indexes the earlier turns of the folder, ten at a time; a dozen turns took 3.8 seconds.
 
 ## Running on two machines
 
@@ -166,7 +182,7 @@ A message that starts with a slash, with the command right after it, is a comman
 | `/think` | Tells how much the model in use thinks and the choices it has. |
 | `/think <choice>` | Chooses it: `on` or `off` for a local model, an effort from `none` to `max` for a model on OpenRouter. Each model keeps its choice during the session. |
 
-What the model thinks before it answers is shown above the reply, in a muted color. Each tool a reply asks for is shown under it: its name, what it acts on, the lines it would add (`+`) or remove (`-`), and, once it ran, a short summary of its result. The status line shows how much of the model's context the conversation takes, as a share and in tokens.
+What the model thinks before it answers is shown above the reply, in a muted color. Each tool a reply asks for is shown under it: its name, what it acts on, the lines it would add (`+`) or remove (`-`), and, once it ran, a short summary of its result. The status line shows how much of the model's context the conversation takes, as a share and in tokens. With the recall on, a muted line under your message says how many earlier turns the model reads with it, or a line in the warning color says why the search failed.
 
 ## Security
 
@@ -175,8 +191,10 @@ What the model thinks before it answers is shown above the reply, in a muted col
 - The server of a local model answers only on `127.0.0.1`, and only to requests with the key the session makes for it when it starts. The key reaches the server through its environment, which other users of the machine cannot read, and not through its command line, which they can; nothing else of the session's environment reaches it, the OpenRouter key included. The requests to it ignore any proxy set in the environment, so the key and the conversation never leave the machine.
 - The log of that server, and the files that tell which session started each server, live in a folder of the temporary folder that only your user can open (`agent-cli-<your user id>`). On Linux, where every user shares the temporary folder, the CLI refuses a folder another user made or can write to.
 - An API model is only used when no local model is configured or when you pick one with `/model`. From then on, the conversation, including the system prompt, is sent to OpenRouter, and only to providers that keep no data.
+- The recall of earlier turns is on only when `AGENT_CLI_EMBEDDING_MODEL` is set. Then each message, and every earlier turn of the folder (your message and the model's last answer, up to 1,500 characters), is sent to OpenRouter to be turned into a vector, also when the conversation runs on the local model, and only to providers that keep no data.
 - A system prompt with personal content belongs in a file that stays out of git.
-- The history, `~/.agent-cli/history.db`, holds every conversation, with what the tools read and what the commands wrote. The file and its folder are created readable only by your user.
+- The history, `~/.agent-cli/history.db`, holds every conversation, with what the tools read and what the commands wrote, and the excerpts and vectors of the recall. The file and its folder are created readable only by your user.
+- Only the connection of the search loads `sqlite-vec`, and it turns the loading of extensions off right after, so no query can load another one; the other connections to the history never load any.
 - Splitting across two machines is off by default, for the reason explained above.
 - The model only asks; the CLI is the one that executes. Writing or editing a file always waits for `y`, and so does reading a secret (`.ssh`, `.gnupg`, `.aws`, the history, `.env` and `.netrc` files). A command waits too, unless the CLI can tell it only reads and reaches no secret. Any other file, anywhere on the machine, is read with no question and goes to the model.
 - A command runs with no input and with no terminal, so it never draws over the screen, and `esc` ends it together with everything it started.

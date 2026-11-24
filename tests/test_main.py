@@ -67,7 +67,14 @@ class ScreenThatOpensTheFirstModel(ScreenThatClosedWithAnError):
 
 def settings_with(model_path: Path | None) -> Settings:
     """Return settings that configure nothing but the path of the local model."""
-    return Settings(model_path=model_path, rpc_servers=(), api_key=None, api_models=(), system_prompt_path=None)
+    return Settings(
+        model_path=model_path,
+        rpc_servers=(),
+        api_key=None,
+        api_models=(),
+        system_prompt_path=None,
+        embedding_model=None,
+    )
 
 
 def settings_for(model_path: Path | None, api_key: str | None, api_models: tuple[str, ...]) -> Settings:
@@ -78,6 +85,7 @@ def settings_for(model_path: Path | None, api_key: str | None, api_models: tuple
         api_key=api_key,
         api_models=api_models,
         system_prompt_path=None,
+        embedding_model=None,
     )
 
 
@@ -152,7 +160,12 @@ def test_program_ends_with_the_exit_code_of_the_screen(monkeypatch: pytest.Monke
 def test_program_runs_the_session_built_from_the_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """The session runs with the models and the system prompt configured, and tools acting from the current folder."""
     settings = Settings(
-        model_path=Path("any.gguf"), rpc_servers=(), api_key=None, api_models=(), system_prompt_path=Path("prompt.md")
+        model_path=Path("any.gguf"),
+        rpc_servers=(),
+        api_key=None,
+        api_models=(),
+        system_prompt_path=Path("prompt.md"),
+        embedding_model=None,
     )
     monkeypatch.setattr(main, "read_system_prompt", lambda prompt_file: f"the prompt in {prompt_file}")
     screens = screens_built_by_main(monkeypatch, settings, ScreenThatClosedWithAnError)
@@ -186,7 +199,12 @@ def test_session_opens_its_models_and_closes_them_when_it_ends(
     system_prompt_file = tmp_path / "system_prompt.md"
     system_prompt_file.write_text("Answer in one line.", encoding="utf-8")
     settings = Settings(
-        model_path=small_model_file, rpc_servers=(), api_key=None, api_models=(), system_prompt_path=system_prompt_file
+        model_path=small_model_file,
+        rpc_servers=(),
+        api_key=None,
+        api_models=(),
+        system_prompt_path=system_prompt_file,
+        embedding_model=None,
     )
     screens = screens_built_by_main(monkeypatch, settings, ScreenThatOpensTheFirstModel)
     with pytest.raises(SystemExit) as ending:
@@ -232,3 +250,32 @@ def test_history_is_kept_in_the_home_folder_by_the_folder_agentcli_runs_in(
     with pytest.raises(SystemExit):
         main.main()
     assert screens[0].conversation.history.working_folder == str(tmp_path.resolve())
+
+
+def test_session_with_a_key_but_no_embedding_model_searches_nothing(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The key alone does not turn the search on, so the turns of a local model never leave the machine."""
+    settings = settings_for(Path("any.gguf"), api_key="the-key", api_models=())
+    screens = screens_built_by_main(monkeypatch, settings, ScreenThatClosedWithAnError)
+    with pytest.raises(SystemExit):
+        main.main()
+    assert screens[0].conversation.recall is None
+
+
+def test_session_searches_earlier_turns_with_the_embedding_model_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The search asks the configured embedding model, with the key, and keeps its vectors in the session's history."""
+    settings = Settings(
+        model_path=Path("any.gguf"),
+        rpc_servers=(),
+        api_key="the-key",
+        api_models=(),
+        system_prompt_path=None,
+        embedding_model="author/embedding",
+    )
+    screens = screens_built_by_main(monkeypatch, settings, ScreenThatClosedWithAnError)
+    with pytest.raises(SystemExit):
+        main.main()
+    [screen] = screens
+    recall = screen.conversation.recall
+    assert recall.embedding_model.model_name == "author/embedding"
+    assert recall.embedding_model.client.headers["Authorization"] == "Bearer the-key"
+    assert recall.history is screen.conversation.history

@@ -21,7 +21,15 @@ from agent_cli.inference.generation import open_local_model
 from agent_cli.inference.model import Model, ToolCall
 from agent_cli.screen.app import Activity, AgentCliApp
 from agent_cli.screen.banner import Banner
-from agent_cli.screen.messages import Notice, Reply, Thinking, ToolView, TurnView, thinking_and_answer_so_far
+from agent_cli.screen.messages import (
+    Notice,
+    Reply,
+    Thinking,
+    ToolView,
+    TurnView,
+    UserMessage,
+    thinking_and_answer_so_far,
+)
 from agent_cli.screen.permission import PermissionAnswer, PermissionPrompt
 from agent_cli.screen.resume import ConversationPicker
 from agent_cli.screen.status import StatusLine
@@ -37,7 +45,8 @@ SECONDS_TO_WAIT = 5
 def new_conversation() -> Conversation:
     """Return a conversation for sessions that run no tool, with its history in a new temporary folder."""
     folder = Path(tempfile.mkdtemp())
-    return Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")), History(folder / "history.db", folder))
+    history = History(folder / "history.db", folder)
+    return Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")), history, recall=None)
 
 
 def session_with(model: Model) -> AgentCliApp:
@@ -701,7 +710,8 @@ async def test_model_that_fails_to_open_in_a_switch_leaves_the_session_on_the_on
 def session_in(folder: Path, model: Model) -> AgentCliApp:
     """Return the screen of a session whose model opens at once and whose tools act from the folder."""
     history_folder = Path(tempfile.mkdtemp())
-    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_folder / "history.db", folder))
+    history = History(history_folder / "history.db", folder)
+    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), history, recall=None)
     return AgentCliApp(conversation, Catalog({MODEL_NAME: lambda: model}))
 
 
@@ -834,6 +844,7 @@ LATE_MESSAGES: dict[str, Callable[[TurnView, ToolUse], Any]] = {
     "finish_turn": lambda turn, use: AgentCliApp.ReplyEnded(turn, False, 1000),
     "refuse_long_message": lambda turn, use: AgentCliApp.MessageTooLong(turn),
     "report_failed_reply": lambda turn, use: AgentCliApp.ReplyFailed(turn, "late"),
+    "show_search": lambda turn, use: AgentCliApp.EarlierTurnsSearched(turn, "earlier turns recalled: 1", "muted"),
 }
 
 
@@ -884,7 +895,7 @@ async def test_turn_cut_by_the_result_of_a_tool_is_reported(tmp_path: Path) -> N
 
 def resuming_session_in(folder: Path, model: Model, history_file: Path) -> AgentCliApp:
     """Return the screen of a session opened with -r, whose history is kept in the file given."""
-    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_file, folder))
+    conversation = Conversation(SYSTEM_PROMPT, Toolbox(folder), History(history_file, folder), recall=None)
     return AgentCliApp(conversation, Catalog({MODEL_NAME: lambda: model}), resume=True)
 
 
@@ -995,3 +1006,56 @@ async def test_second_quit_closes_without_waiting_for_the_turn(tmp_path: Path) -
         await wait_until(lambda: app.return_code is not None, pilot)
     model.allow_piece()
     model.allow_piece()
+
+
+class RecallThatFinds:
+    """Stands in for the search of earlier turns: it brings back the same excerpts each time, or fails as told."""
+
+    def __init__(self, excerpts: list[str], failure: Exception | None = None) -> None:
+        """Keep what each search gives."""
+        self.excerpts = excerpts
+        self.failure = failure
+
+    def closest_excerpts(self, user_text: str, turns_in_context: int, stop_requested: threading.Event) -> list[str]:
+        """Give the excerpts, or fail as told."""
+        if self.failure is not None:
+            raise self.failure
+        return self.excerpts
+
+
+def session_recalling(recall: RecallThatFinds, model: Model) -> AgentCliApp:
+    """Return the screen of a session that searches earlier turns with the stand-in, whose model opens at once."""
+    folder = Path(tempfile.mkdtemp())
+    history = History(folder / "history.db", folder)
+    conversation = Conversation(SYSTEM_PROMPT, Toolbox(Path("no-tool-runs-here")), history, recall)
+    return AgentCliApp(conversation, Catalog({MODEL_NAME: lambda: model}))
+
+
+async def test_turns_recalled_are_told_between_the_message_and_the_reply() -> None:
+    """A muted line under the user's message says how many earlier turns the model reads with it."""
+    excerpts = ["User: a\nAssistant: b", "User: c\nAssistant: d"]
+    app = session_recalling(RecallThatFinds(excerpts), ScriptedModel(["Ok."]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("hi", app, pilot)
+        await wait_for_message_box(app, pilot)
+        (turn,) = turns_on_screen(app)
+        assert [type(child) for child in turn.children] == [UserMessage, Notice, Thinking, Reply]
+        assert notices_on_screen(app) == ["earlier turns recalled: 2"]
+        assert turn.query_one(Notice).has_class("muted")
+        assert turn.reply.source == "Ok."
+
+
+async def test_search_that_fails_is_warned_and_the_reply_still_comes() -> None:
+    """A failed search gets a warning with its reason in the turn, and the model replies anyway."""
+    failure = ConnectionError("the connection to OpenRouter failed: no route to host")
+    app = session_recalling(RecallThatFinds([], failure), ScriptedModel(["Ok."]))
+    async with app.run_test() as pilot:
+        await wait_for_message_box(app, pilot)
+        await send("hi", app, pilot)
+        await wait_for_message_box(app, pilot)
+        (turn,) = turns_on_screen(app)
+        warning = "earlier turns not searched: the connection to OpenRouter failed: no route to host"
+        assert notices_on_screen(app) == [warning]
+        assert turn.query_one(Notice).has_class("warning")
+        assert turn.reply.source == "Ok."
